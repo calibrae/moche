@@ -2,7 +2,7 @@
 FROM debian:stable-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      openssh-server mosh tcpdump iproute2 locales vim-tiny htop less ncurses-term procps \
+      openssh-server mosh tcpdump iproute2 locales vim-tiny htop less ncurses-term procps tmux \
     && sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen && locale-gen \
     && rm -rf /var/lib/apt/lists/*
 ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8

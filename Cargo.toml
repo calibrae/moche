@@ -15,3 +15,4 @@ moche-core = { path = "crates/moche-core" }
 base64 = "0.23"
 aes = "0.9"
 ocb3 = "0.2"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
