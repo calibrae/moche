@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/moche-core", "crates/moche-ffi", "crates/moche-cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["moche contributors"]
+repository = "https://github.com/calibrae/moche"
+publish = false
+
+[workspace.dependencies]
+moche-core = { path = "crates/moche-core" }
+base64 = "0.23"
+aes = "0.9"
+ocb3 = "0.2"

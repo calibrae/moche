@@ -1,0 +1,15 @@
+[package]
+name = "moche-ffi"
+description = "C ABI for moche-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+moche-core.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "moche-core"
+description = "Sans-IO mosh client core (clean-room reimplementation)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+
+[dev-dependencies]
+aes.workspace = true
+ocb3.workspace = true

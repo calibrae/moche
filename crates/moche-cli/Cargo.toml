@@ -1,0 +1,16 @@
+[package]
+name = "moche-cli"
+description = "Reference CLI client for moche-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "moche-cli"
+path = "src/main.rs"
+
+[dependencies]
+moche-core.workspace = true
