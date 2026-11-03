@@ -27,11 +27,16 @@ const INNER_HEADER: usize = 14;
 /// Under the 1280-byte IPv6 minimum MTU, so it never fragments at IP level.
 pub const MAX_DATAGRAM: usize = WIRE_NONCE_LEN + TAG_LEN + INNER_HEADER + FRAGMENT_PAYLOAD;
 
-/// Most fragments accepted for one message (about 300 KB compressed).
-const MAX_FRAGMENTS: u16 = 256;
+/// Most fragments accepted or produced for one message: 2048 x 1214 bytes, about
+/// 2.4 MB compressed. This is moche's choice, not an observed server value. A
+/// 1000x1000 full repaint is at worst a few MB of VT text that compresses well
+/// below that. (The wire field allows up to 32768.) Our own sender stays far
+/// below it: one instruction carries at most `ssp::MAX_STATE_BYTES` of input.
+pub(crate) const MAX_FRAGMENTS: u16 = 2048;
 
-/// Largest inflated instruction accepted (guards against zlib bombs).
-const MAX_INFLATED: u64 = 8 << 20;
+/// Largest inflated instruction accepted (guards against zlib bombs). 16 MiB is
+/// well above a worst-case 1000x1000 repaint with an SGR change on every cell.
+const MAX_INFLATED: u64 = 16 << 20;
 
 /// Message groups kept while waiting for missing fragments.
 const MAX_GROUPS: usize = 8;
@@ -264,7 +269,7 @@ impl Reassembler {
             return Ok(None);
         }
         if f.num >= MAX_FRAGMENTS {
-            return Err(NetError::BadFragment);
+            return Err(NetError::TooLarge);
         }
         if !self.groups.contains_key(&f.id) && self.groups.len() >= MAX_GROUPS {
             let oldest = self.groups.keys().next().copied().unwrap_or(f.id);
@@ -506,10 +511,7 @@ mod tests {
             last,
             data: vec![0; len],
         };
-        assert_eq!(
-            r.push(f(MAX_FRAGMENTS, false, 1)),
-            Err(NetError::BadFragment)
-        );
+        assert_eq!(r.push(f(MAX_FRAGMENTS, false, 1)), Err(NetError::TooLarge));
         assert_eq!(r.push(f(0, false, 1215)), Err(NetError::BadFragment));
         // two different final fragments
         assert!(r.push(f(2, true, 5)).unwrap().is_none());

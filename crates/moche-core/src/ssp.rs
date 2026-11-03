@@ -5,7 +5,9 @@
 //!
 //! Sending: user input is a numbered stream of elements. Each frame carries
 //! the cumulative diff from the last state the server acked to the latest one
-//! (so any lost frame is repaired by the next). Unacked data is re-sent every
+//! (so any lost frame is repaired by the next), bounded to `MAX_STATE_BYTES`
+//! of raw input: a state is any prefix of the input stream, so a larger backlog
+//! goes out as a chain of states, each acked before the next is cut. Unacked data is re-sent every
 //! frame slot (about SRTT/2, at least 20 ms) with a fresh datagram sequence
 //! number and fragment id, reusing the same `new_num`. Idle, an empty frame
 //! (with a fresh `new_num`) goes out as a delayed ack after 100 ms, or as a
@@ -19,7 +21,7 @@
 use std::collections::VecDeque;
 
 use crate::crypto::Session;
-use crate::network::{fragment, Cipher, Direction, Inner, Reassembler, Rtt};
+use crate::network::{fragment, Cipher, Direction, Inner, NetError, Reassembler, Rtt};
 use crate::proto::{decode_diff, encode_diff, Element, Instruction, MAX_CHAFF, PROTOCOL_VERSION};
 
 /// `new_num` marking the end of the session.
@@ -35,6 +37,14 @@ const COLLECT_MS: u64 = 8;
 const ACK_DELAY_MS: u64 = 100;
 /// Idle heartbeat.
 const HEARTBEAT_MS: u64 = 3000;
+
+/// Most raw input bytes one instruction carries (the cumulative diff from the
+/// acked state to the state being sent). Incompressible, this is about 54
+/// fragments, far below the fragment cap, so a frame is always buildable.
+pub const MAX_STATE_BYTES: usize = 64 * 1024;
+/// Largest single `Data` element. Big `send_keys` calls are cut into pieces of
+/// this size so every cut point (state boundary) is at most this far apart.
+const CHUNK_BYTES: usize = 16 * 1024;
 
 /// Source of random bytes supplied by the host (used for chaff only).
 pub type Rng = Box<dyn FnMut(&mut [u8]) + Send>;
@@ -81,6 +91,13 @@ pub struct Transport {
     elements: VecDeque<Element>,
     total: u64,
     acked_count: u64,
+    /// Data bytes in `elements` (unacked, sent or not).
+    queued: u64,
+    /// Frames that could not be built or sealed (should stay 0).
+    send_errors: u64,
+    /// Received datagrams that authenticated but whose message was rejected
+    /// (bad fragment, over a size limit, bad zlib, bad instruction or diff).
+    rx_errors: u64,
     /// Sent states as `(num, element count)`; the front is the acked state.
     sent: VecDeque<(u64, u64)>,
     unsent_since: Option<u64>,
@@ -110,6 +127,9 @@ impl Transport {
             elements: VecDeque::new(),
             total: 0,
             acked_count: 0,
+            queued: 0,
+            send_errors: 0,
+            rx_errors: 0,
             sent: VecDeque::from([(0, 0)]),
             unsent_since: None,
             last_send: None,
@@ -127,9 +147,28 @@ impl Transport {
 
     /// Queues keystrokes (or pasted bytes) for the server.
     pub fn send_keys(&mut self, now_ms: u64, keys: &[u8]) {
-        if !keys.is_empty() {
-            self.push(now_ms, Element::Data(keys.to_vec()));
+        for piece in keys.chunks(CHUNK_BYTES) {
+            self.push(now_ms, Element::Data(piece.to_vec()));
         }
+    }
+
+    /// Input bytes accepted but not yet acked by the server (backpressure:
+    /// a host may pause a big paste while this is large).
+    pub fn queued_bytes(&self) -> u64 {
+        self.queued
+    }
+
+    /// Frames that could not be built or sealed. Expected to stay 0; nonzero
+    /// means input is stuck and the host should treat the session as failed.
+    pub fn send_errors(&self) -> u64 {
+        self.send_errors
+    }
+
+    /// Received messages dropped as invalid or over a limit (see
+    /// `network::fragment` limits). Nonzero means the server sent something
+    /// moche could not accept.
+    pub fn rx_errors(&self) -> u64 {
+        self.rx_errors
     }
 
     /// Queues a terminal size change. Also send one right after connecting.
@@ -149,6 +188,9 @@ impl Transport {
         }
         if self.total == self.last_count() {
             self.unsent_since = Some(now_ms);
+        }
+        if let Element::Data(b) = &e {
+            self.queued += b.len() as u64;
         }
         self.elements.push_back(e);
         self.total += 1;
@@ -184,12 +226,20 @@ impl Transport {
                 self.rtt.sample_from_reply(now_ms, r);
             }
         }
-        let Ok(Some(message)) = self.reasm.push(inner.frag) else {
-            return Vec::new();
+        let message = match self.reasm.push(inner.frag) {
+            Ok(Some(m)) => m,
+            Ok(None) => return Vec::new(),
+            Err(_) => {
+                self.rx_errors += 1;
+                return Vec::new();
+            }
         };
         match Instruction::decode(&message) {
             Ok(i) if i.version == PROTOCOL_VERSION => self.accept(now_ms, i),
-            _ => Vec::new(),
+            _ => {
+                self.rx_errors += 1;
+                Vec::new()
+            }
         }
     }
 
@@ -207,6 +257,7 @@ impl Transport {
             return Vec::new();
         }
         let Ok(elements) = decode_diff(&i.diff) else {
+            self.rx_errors += 1;
             return Vec::new();
         };
         self.latest = i.new_num;
@@ -249,13 +300,35 @@ impl Transport {
         };
         self.sent.drain(..p);
         let count = self.sent[0].1;
-        let drop = (count - self.acked_count) as usize;
-        self.elements.drain(..drop.min(self.elements.len()));
+        let drop = ((count - self.acked_count) as usize).min(self.elements.len());
+        for e in self.elements.drain(..drop) {
+            if let Element::Data(b) = e {
+                self.queued -= b.len() as u64;
+            }
+        }
         self.acked_count = count;
     }
 
     fn last_count(&self) -> u64 {
         self.sent.back().map_or(0, |s| s.1)
+    }
+
+    /// Highest element count (global index) the next frame may carry: the
+    /// longest prefix of the unacked elements whose data is at most
+    /// `MAX_STATE_BYTES`, but always at least one element.
+    fn cut_count(&self) -> u64 {
+        let mut bytes = 0usize;
+        let mut n = 0u64;
+        for e in &self.elements {
+            if let Element::Data(b) = e {
+                if n > 0 && bytes + b.len() > MAX_STATE_BYTES {
+                    break;
+                }
+                bytes += b.len();
+            }
+            n += 1;
+        }
+        self.acked_count + n
     }
 
     fn frame_interval(&self) -> u64 {
@@ -278,7 +351,7 @@ impl Transport {
         }
         if self.data_outstanding() {
             let by_interval = self.last_send.map(|t| t + self.frame_interval());
-            let mut t = if self.total > self.last_count() {
+            let mut t = if self.cut_count() > self.last_count() {
                 let collect = self.unsent_since.unwrap_or(0) + COLLECT_MS;
                 by_interval.map_or(collect, |b| b.max(collect))
             } else {
@@ -309,11 +382,13 @@ impl Transport {
         let old_num = self.sent[0].0;
         let last_num = self.sent.back().map_or(0, |s| s.0);
         let (new_num, diff) = if self.data_outstanding() {
-            let diff = encode_diff(&coalesce(&self.elements));
-            if self.total > self.last_count() {
+            let cut = self.cut_count().max(self.last_count());
+            let n_el = (cut - self.acked_count) as usize;
+            let diff = encode_diff(&coalesce(self.elements.iter().take(n_el)));
+            if cut > self.last_count() {
                 let n = last_num + 1;
-                self.sent.push_back((n, self.total));
-                self.unsent_since = None;
+                self.sent.push_back((n, cut));
+                self.unsent_since = (self.total > cut).then_some(now_ms);
                 (n, diff)
             } else {
                 (last_num, diff)
@@ -337,11 +412,18 @@ impl Transport {
             chaff,
         }
         .encode();
+        if self.emit(now_ms, &message).is_err() {
+            self.send_errors += 1;
+        }
+        self.last_send = Some(now_ms);
+        self.ack_due = None;
+    }
+
+    /// Fragments, seals and queues one serialized instruction.
+    fn emit(&mut self, now_ms: u64, message: &[u8]) -> Result<(), NetError> {
         let id = self.frag_id;
         self.frag_id += 1;
-        let Ok(frags) = fragment(id, &message) else {
-            return;
-        };
+        let frags = fragment(id, message)?;
         for (k, frag) in frags.into_iter().enumerate() {
             let ts_reply = if k == 0 {
                 self.take_reply(now_ms)
@@ -355,12 +437,12 @@ impl Transport {
             };
             let seq = self.seq;
             self.seq += 1;
-            if let Ok(d) = self.cipher.seal(Direction::ToServer, seq, &inner.encode()) {
-                self.outbox.push_back(d);
-            }
+            let d = self
+                .cipher
+                .seal(Direction::ToServer, seq, &inner.encode())?;
+            self.outbox.push_back(d);
         }
-        self.last_send = Some(now_ms);
-        self.ack_due = None;
+        Ok(())
     }
 
     /// Echo of the peer's latest timestamp plus the time we held it.
@@ -372,7 +454,7 @@ impl Transport {
 }
 
 /// Merges adjacent data elements, keeping order.
-fn coalesce(els: &VecDeque<Element>) -> Vec<Element> {
+fn coalesce<'a>(els: impl Iterator<Item = &'a Element>) -> Vec<Element> {
     let mut out: Vec<Element> = Vec::new();
     for e in els {
         match (out.last_mut(), e) {
@@ -469,11 +551,10 @@ mod tests {
     fn datagrams_never_exceed_max_datagram() {
         assert_eq!(crate::network::MAX_DATAGRAM, 1252);
         let mut t = transport();
-        // ~200 KB of incompressible keystrokes (about 165 full fragments). Larger
-        // incompressible input exceeds the 256-fragment limit and is not sent at all
-        // (known gap: fragment() returns TooLarge and build_frame drops the frame).
+        // 1 MB of incompressible keystrokes: goes out as a chain of bounded states
+        // (nothing is acked here, so the first state is resent every slot).
         let mut seed = 99u64;
-        let big: Vec<u8> = (0..200_000)
+        let big: Vec<u8> = (0..1_000_000)
             .map(|_| {
                 seed = seed
                     .wrapping_mul(6364136223846793005)
@@ -497,6 +578,9 @@ mod tests {
             }
         }
         assert!(total > 100, "expected many fragments, got {total}");
+        assert_eq!(t.send_errors(), 0);
+        // only the first bounded state is in flight, not the whole megabyte
+        assert!(total < 6 * 70, "too many fragments: {total}");
     }
 
     #[test]
@@ -773,5 +857,249 @@ mod tests {
             }
         }
         assert!(seen.len() >= 30);
+    }
+
+    /// Deterministic pseudo-random bytes (incompressible).
+    fn noise(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// Server model: reassembles what the client sends, checks the state
+    /// chain, rebuilds the stream and produces acks.
+    struct Sim {
+        srv: Server,
+        reasm: Reassembler,
+        /// state num -> data bytes of the stream up to that state
+        states: std::collections::BTreeMap<u64, Vec<u8>>,
+        resizes: usize,
+        acked: u64,
+        reply_num: u64,
+        datagrams: usize,
+        last_new: u64,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            Sim {
+                srv: Server::new(),
+                reasm: Reassembler::new(),
+                states: std::collections::BTreeMap::from([(0, Vec::new())]),
+                resizes: 0,
+                acked: 0,
+                reply_num: 0,
+                datagrams: 0,
+                last_new: 0,
+            }
+        }
+
+        fn receive(&mut self, d: &[u8]) {
+            assert!(d.len() <= crate::network::MAX_DATAGRAM);
+            self.datagrams += 1;
+            let o = self.srv.cipher.open(d).unwrap();
+            let inner = Inner::decode(&o.plaintext).unwrap();
+            let Some(msg) = self.reasm.push(inner.frag).unwrap() else {
+                return;
+            };
+            let i = Instruction::decode(&msg).unwrap();
+            assert!(i.old_num < i.new_num);
+            assert!(i.new_num >= self.last_new, "new_num went backwards");
+            self.last_new = i.new_num;
+            let base = self.states.get(&i.old_num).expect("unknown base").clone();
+            let mut stream = base;
+            for e in decode_diff(&i.diff).unwrap() {
+                match e {
+                    Element::Data(b) => stream.extend_from_slice(&b),
+                    Element::Resize { .. } => self.resizes += 1,
+                    Element::EchoAck(_) => {}
+                }
+            }
+            match self.states.get(&i.new_num) {
+                Some(prev) => {
+                    assert_eq!(*prev, stream, "state {} changed", i.new_num)
+                }
+                None => {
+                    self.states.insert(i.new_num, stream);
+                }
+            }
+            if i.new_num > self.acked {
+                self.acked = i.new_num;
+            }
+        }
+
+        fn ack_datagram(&mut self) -> Vec<u8> {
+            self.reply_num += 1;
+            let i = Server::instr(0, self.reply_num, self.acked, &[]);
+            self.srv.send(0, None, i).remove(0)
+        }
+
+        fn stream(&self) -> &[u8] {
+            &self.states[&self.acked]
+        }
+    }
+
+    /// Runs the transport until `want` bytes are delivered and acked.
+    /// `lossy(step)` returns (drop ack, duplicate ack).
+    fn run(
+        t: &mut Transport,
+        sim: &mut Sim,
+        want: &[u8],
+        max_slots: usize,
+        mut lossy: impl FnMut(usize) -> (bool, bool),
+    ) -> usize {
+        let mut now = 0u64;
+        for slot in 0..max_slots {
+            if let Some(d) = t.next_deadline_ms() {
+                now = now.max(d);
+            }
+            let out = drain(t, now);
+            for d in &out {
+                sim.receive(d);
+            }
+            if !out.is_empty() {
+                let (drop, dup) = lossy(slot);
+                if !drop {
+                    let a = sim.ack_datagram();
+                    t.handle_datagram(now, &a);
+                    if dup {
+                        t.handle_datagram(now, &a);
+                    }
+                }
+            }
+            now += 1;
+            if sim.stream() == want && t.queued_bytes() == 0 {
+                return slot + 1;
+            }
+        }
+        panic!(
+            "no convergence: delivered {} of {} bytes, queued {}",
+            sim.stream().len(),
+            want.len(),
+            t.queued_bytes()
+        );
+    }
+
+    #[test]
+    fn big_incompressible_send_keys_is_fully_delivered() {
+        for (len, seed) in [(1 << 20, 5u64), (16 << 20, 6)] {
+            let data = noise(seed, len);
+            let mut t = transport();
+            let mut sim = Sim::new();
+            t.send_keys(0, &data);
+            assert_eq!(t.queued_bytes(), len as u64);
+            let slots = run(
+                &mut t,
+                &mut sim,
+                &data,
+                len / MAX_STATE_BYTES * 2 + 20,
+                |_| (false, false),
+            );
+            assert!(slots >= len / MAX_STATE_BYTES);
+            assert_eq!(t.send_errors(), 0);
+            assert_eq!(t.queued_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn random_sizes_chunks_and_ack_loss_converge() {
+        let mut r = 12345u64;
+        let mut next = move |m: u64| {
+            r = r
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (r >> 33) % m
+        };
+        for case in 0..12u64 {
+            let len = if case == 0 { 0 } else { next(300_000) as usize };
+            let data = noise(case + 100, len);
+            let mut t = transport();
+            let mut sim = Sim::new();
+            // random chunking, with a resize and a few tiny sends mixed in
+            let mut pos = 0;
+            let mut now = 0;
+            while pos < data.len() {
+                let n = (next(90_000) as usize + 1).min(data.len() - pos);
+                t.send_keys(now, &data[pos..pos + n]);
+                pos += n;
+                if next(4) == 0 {
+                    t.send_resize(now, 80 + next(50) as u16, 24);
+                }
+                now += next(5);
+            }
+            let mut loss = move |_: usize| (next(3) == 0, next(3) == 0);
+            let slots = run(&mut t, &mut sim, &data, 2000, &mut loss);
+            assert!(slots > 0 || len == 0);
+            assert_eq!(t.send_errors(), 0);
+            assert_eq!(t.queued_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn unbuildable_frame_is_counted_not_dropped_silently() {
+        let mut t = transport();
+        // an instruction no frame of ours can reach: incompressible, over the cap
+        let huge = noise(7, 3 * 1024 * 1024);
+        assert_eq!(t.emit(0, &huge), Err(NetError::TooLarge));
+        assert!(drain(&mut t, 0).is_empty());
+        assert_eq!(t.send_errors(), 0); // emit itself only reports; build_frame counts
+                                        // a rejected server message is counted on receive
+        let mut srv = Server::new();
+        let ev = t.handle_datagram(0, &srv.send(0, None, Server::instr(0, 1, 0, &[]))[0]);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(t.rx_errors(), 0);
+        let mut bad = Server::instr(0, 2, 0, &[]);
+        bad.version = 9;
+        t.handle_datagram(0, &srv.send(0, None, bad)[0]);
+        assert_eq!(t.rx_errors(), 1);
+    }
+
+    #[test]
+    fn oversized_server_message_is_counted() {
+        use crate::network::{Fragment, MAX_FRAGMENTS};
+        let mut t = transport();
+        let srv = Server::new();
+        let inner = Inner {
+            ts: 0,
+            ts_reply: None,
+            frag: Fragment {
+                id: 1,
+                num: MAX_FRAGMENTS,
+                last: false,
+                data: vec![0; 10],
+            },
+        };
+        let d = srv
+            .cipher
+            .seal(Direction::ToClient, 0, &inner.encode())
+            .unwrap();
+        assert!(t.handle_datagram(0, &d).is_empty());
+        assert_eq!(t.rx_errors(), 1);
+    }
+
+    #[test]
+    fn large_server_repaint_is_accepted() {
+        let mut t = transport();
+        let mut srv = Server::new();
+        // 1.5 MB of noise is ~1250 fragments: over the old 256 cap, under 2048
+        let big = noise(3, 1_500_000);
+        let d = srv.send(
+            0,
+            None,
+            Server::instr(0, 1, 0, &[Element::Data(big.clone())]),
+        );
+        assert!(d.len() > 1000);
+        let mut ev = Vec::new();
+        for x in &d {
+            ev.extend(t.handle_datagram(0, x));
+        }
+        assert_eq!(ev.len(), 1);
+        assert_eq!(t.rx_errors(), 0);
     }
 }
