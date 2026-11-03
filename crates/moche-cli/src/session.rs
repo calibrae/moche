@@ -33,6 +33,37 @@ pub enum Outcome {
     Signal(i32),
 }
 
+/// Counters printed by `--stats` after the terminal is restored.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Stats {
+    pub queued_bytes: u64,
+    pub send_errors: u64,
+    pub rx_errors: u64,
+    /// Server instructions dropped because their base state was lost.
+    pub rx_gaps: u64,
+    pub datagrams_sent: u64,
+    pub datagrams_received: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+impl Stats {
+    pub fn report(&self) -> String {
+        format!(
+            "moche stats: queued_bytes={} send_errors={} rx_errors={} rx_gaps={} \
+             datagrams_sent={} datagrams_received={} bytes_sent={} bytes_received={}",
+            self.queued_bytes,
+            self.send_errors,
+            self.rx_errors,
+            self.rx_gaps,
+            self.datagrams_sent,
+            self.datagrams_received,
+            self.bytes_sent,
+            self.bytes_received
+        )
+    }
+}
+
 pub struct Signals {
     pub term: Arc<AtomicBool>,
     pub hup: Arc<AtomicBool>,
@@ -73,11 +104,13 @@ fn urandom() -> Result<Rng, String> {
     }))
 }
 
+/// Runs the session; `stats` is filled in whatever the outcome.
 pub fn run(
     session: &Session,
     server: SocketAddr,
     display: &mut dyn Display,
     signals: &Signals,
+    stats: &mut Stats,
 ) -> Result<Outcome, String> {
     let bind: SocketAddr = if server.is_ipv4() {
         "0.0.0.0:0".parse().map_err(|_| "bind addr")?
@@ -90,8 +123,33 @@ pub fn run(
         .map_err(|e| format!("socket: {e}"))?;
 
     let start = Instant::now();
+    let mut transport = Transport::new(session, start.elapsed().as_millis() as u64, urandom()?);
+    let result = event_loop(
+        &mut transport,
+        start,
+        &socket,
+        server,
+        display,
+        signals,
+        stats,
+    );
+    stats.queued_bytes = transport.queued_bytes();
+    stats.send_errors = transport.send_errors();
+    stats.rx_errors = transport.rx_errors();
+    stats.rx_gaps = transport.rx_gaps();
+    result
+}
+
+fn event_loop(
+    transport: &mut Transport,
+    start: Instant,
+    socket: &UdpSocket,
+    server: SocketAddr,
+    display: &mut dyn Display,
+    signals: &Signals,
+    stats: &mut Stats,
+) -> Result<Outcome, String> {
     let now = || start.elapsed().as_millis() as u64;
-    let mut transport = Transport::new(session, now(), urandom()?);
     let (mut cols, mut rows) = term::size();
     transport.send_resize(now(), cols, rows);
 
@@ -113,7 +171,10 @@ pub fn run(
 
         while let Some(d) = transport.poll_transmit(now()) {
             // Errors (network down mid-roam) are retried by SSP's resends.
-            let _ = socket.send_to(&d, server);
+            if socket.send_to(&d, server).is_ok() {
+                stats.datagrams_sent += 1;
+                stats.bytes_sent += d.len() as u64;
+            }
         }
 
         let t = now();
@@ -128,7 +189,7 @@ pub fn run(
         };
         let mut fds = [
             PollFd::new(&stdin, PollFlags::IN),
-            PollFd::new(&socket, PollFlags::IN),
+            PollFd::new(socket, PollFlags::IN),
             PollFd::new(&signals.wake, PollFlags::IN),
         ];
         match poll(&mut fds, Some(&timeout)) {
@@ -158,6 +219,8 @@ pub fn run(
 
         if sock_ev.contains(PollFlags::IN) {
             while let Ok((n, _)) = socket.recv_from(&mut buf) {
+                stats.datagrams_received += 1;
+                stats.bytes_received += n as u64;
                 let t = now();
                 let events = transport.handle_datagram(t, &buf[..n]);
                 if !events.is_empty() {

@@ -77,9 +77,9 @@ impl Display for ScreenDisplay {
                 self.desync = false;
                 self.dirty = true;
             }
-            // v1: ignore and flag it. The transport still acks this state,
-            // so the server may keep diffing against a base we lack; see
-            // docs/protocol.md U13 for what a proper recovery would be.
+            // Safety net only: the transport delivers a diff only if its base
+            // is held (and never acks one it did not deliver), so this should
+            // not trigger with a sane server. Flag it for the status line.
             Err(_) => self.desync = true,
         }
         for ev in self.screen.take_events() {

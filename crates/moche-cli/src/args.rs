@@ -15,6 +15,8 @@ options:
   --direct HOST PORT          skip ssh: connect to an already running mosh-server
   --key-stdin                 with --direct: read the session key from stdin
   --no-altscreen              do not use the terminal's alternate screen
+  --stats                     on exit, print transport counters to stderr (queued bytes,
+                              send/receive errors, gaps, datagrams and bytes)
   -V, --version               print version
   -h, --help                  print this help
 
@@ -51,6 +53,8 @@ pub struct Opts {
     pub server_lang: Option<String>,
     pub port_range: Option<String>,
     pub altscreen: bool,
+    /// Print transport counters to stderr on exit.
+    pub stats: bool,
     /// Hidden debug option: write host diffs straight to the tty.
     pub passthrough: bool,
 }
@@ -70,6 +74,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut server_lang = None;
     let mut port_range = None;
     let mut altscreen = true;
+    let mut stats = false;
     let mut passthrough = false;
     let mut direct: Option<(String, u16)> = None;
     let mut key_stdin = false;
@@ -96,6 +101,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 port_range = Some(r);
             }
             "--no-altscreen" => altscreen = false,
+            "--stats" => stats = true,
             "--passthrough" => passthrough = true,
             "--key-stdin" => key_stdin = true,
             "--direct" => {
@@ -145,6 +151,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         server_lang,
         port_range,
         altscreen,
+        stats,
         passthrough,
     })))
 }
@@ -187,6 +194,13 @@ mod tests {
             }
         );
         assert!(o.altscreen);
+        assert!(!o.stats);
+    }
+
+    #[test]
+    fn stats_flag() {
+        assert!(opts("--stats u@h").stats);
+        assert!(USAGE.contains("--stats"));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use args::{Mode, Opts, Parsed};
 use moche_core::crypto::Session;
-use session::{Outcome, Signals};
+use session::{Outcome, Signals, Stats};
 
 const EXIT_ERROR: u8 = 1;
 const EXIT_USAGE: u8 = 2;
@@ -76,8 +76,12 @@ fn main() -> ExitCode {
     };
     let (cols, rows) = term::size();
     let mut display = display::make_display(opts.passthrough, cols, rows);
-    let result = session::run(&session, addr, display.as_mut(), &signals);
+    let mut stats = Stats::default();
+    let result = session::run(&session, addr, display.as_mut(), &signals, &mut stats);
     drop(guard);
+    if opts.stats {
+        eprintln!("{}", stats.report());
+    }
 
     match result {
         Ok(Outcome::Shutdown) => {
