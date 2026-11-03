@@ -26,3 +26,12 @@ opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# iOS static libs (tools/ios/build-xcframework.sh). No LTO: fat/thin LTO leaves LLVM
+# bitcode around, which App Store Connect can reject and Xcode's LLVM cannot read.
+[profile.ios]
+inherits = "release"
+lto = "off"
+codegen-units = 1
+debug = 0
+strip = "debuginfo"

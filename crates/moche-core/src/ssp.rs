@@ -466,6 +466,40 @@ mod tests {
     }
 
     #[test]
+    fn datagrams_never_exceed_max_datagram() {
+        assert_eq!(crate::network::MAX_DATAGRAM, 1252);
+        let mut t = transport();
+        // ~200 KB of incompressible keystrokes (about 165 full fragments). Larger
+        // incompressible input exceeds the 256-fragment limit and is not sent at all
+        // (known gap: fragment() returns TooLarge and build_frame drops the frame).
+        let mut seed = 99u64;
+        let big: Vec<u8> = (0..200_000)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 33) as u8
+            })
+            .collect();
+        t.send_keys(10, &big);
+        let mut total = 0;
+        let mut now = 10;
+        // several rounds: first sends and unacked resends, plus a resize and small keys
+        for round in 0..6 {
+            if round == 2 {
+                t.send_resize(now, 120, 40);
+                t.send_keys(now, b"x");
+            }
+            now += 400;
+            for d in drain(&mut t, now) {
+                assert!(d.len() <= crate::network::MAX_DATAGRAM, "len {}", d.len());
+                total += 1;
+            }
+        }
+        assert!(total > 100, "expected many fragments, got {total}");
+    }
+
+    #[test]
     fn keys_go_out_after_collection_delay_and_resend_until_acked() {
         let srv = Server::new();
         let mut t = transport();

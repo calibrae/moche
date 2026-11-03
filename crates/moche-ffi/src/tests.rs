@@ -253,6 +253,72 @@ fn loopback_keys_are_encrypted_for_the_server() {
     assert_eq!(moche_session_free(s), MOCHE_OK);
 }
 
+/// `#define NAME <int>` from the header text.
+fn header_define(name: &str) -> usize {
+    let h = include_str!("../include/moche.h");
+    let pat = format!("#define {name} ");
+    let line = h.lines().find(|l| l.starts_with(&pat)).expect("define");
+    line[pat.len()..].trim().parse().expect("integer")
+}
+
+#[test]
+fn header_max_datagram_matches_core() {
+    assert_eq!(
+        header_define("MOCHE_MAX_DATAGRAM"),
+        moche_core::network::MAX_DATAGRAM
+    );
+}
+
+#[test]
+fn transmitted_datagrams_respect_max_datagram() {
+    let s = new_session(80, 24, 0);
+    let mut seed = 7u64;
+    let big: Vec<u8> = (0..200_000)
+        .map(|_| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as u8
+        })
+        .collect();
+    assert_eq!(
+        moche_session_send_keys(s, 0, big.as_ptr(), big.len()),
+        MOCHE_OK
+    );
+    let mut n = 0;
+    for now in [500, 1000, 2000] {
+        while let Some(d) = poll(s, now) {
+            assert!(d.len() <= header_define("MOCHE_MAX_DATAGRAM"));
+            n += 1;
+        }
+    }
+    assert!(n > 100);
+    assert_eq!(moche_session_free(s), MOCHE_OK);
+}
+
+/// Same throwaway key and captured server datagram as the Swift known-answer test.
+#[test]
+fn captured_server_datagram_is_authentic_and_paints() {
+    const K: &str = "Ixu2un/jwqLpFzsnDHm5lw";
+    const D: &str = "80000000000000077d3eff25273194f8472a9e5058d9ea455e55cff4c586b9b6a44ffe88adddf19b5bc49639fa139e5c49a731d46208d75d1e7e65d9661396";
+    let d: Vec<u8> = (0..D.len() / 2)
+        .map(|i| u8::from_str_radix(&D[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    let mut s = null_mut();
+    assert_eq!(
+        moche_session_new(K.as_ptr(), K.len(), 80, 24, 0, &mut s),
+        MOCHE_OK
+    );
+    assert_eq!(
+        moche_session_handle_datagram(s, 5, d.as_ptr(), d.len()),
+        MOCHE_OK
+    );
+    let mut p = MocheBytes::EMPTY;
+    assert_eq!(moche_session_take_paint(s, &mut p), MOCHE_OK);
+    assert!(!take(&mut p).is_empty());
+    assert_eq!(moche_session_free(s), MOCHE_OK);
+}
+
 #[test]
 fn garbage_datagrams_are_nonfatal() {
     let s = new_session(80, 24, 0);

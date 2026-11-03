@@ -1,4 +1,4 @@
-module Moche [system] {
+module MocheFFI [system] {
     header "moche.h"
     export *
 }

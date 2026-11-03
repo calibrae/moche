@@ -23,6 +23,10 @@ pub const FRAGMENT_PAYLOAD: usize = 1214;
 /// Plaintext bytes before the payload: ts, ts_reply, frag id, flags.
 const INNER_HEADER: usize = 14;
 
+/// Largest datagram moche sends: nonce + tag + inner header + a full fragment (1252).
+/// Under the 1280-byte IPv6 minimum MTU, so it never fragments at IP level.
+pub const MAX_DATAGRAM: usize = WIRE_NONCE_LEN + TAG_LEN + INNER_HEADER + FRAGMENT_PAYLOAD;
+
 /// Most fragments accepted for one message (about 300 KB compressed).
 const MAX_FRAGMENTS: u16 = 256;
 

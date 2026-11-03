@@ -166,6 +166,13 @@ extern "C" {
 #define MOCHE_KEY_CHARS 22
 #define MOCHE_KEY_BUF 23
 
+/* Largest UDP payload moche_session_poll_transmit can return, in bytes:
+ * 8 (nonce) + 16 (tag) + 14 (inner header) + 1214 (fragment payload). Below the
+ * 1280-byte IPv6 minimum MTU and WireGuard's ~1420, so a datagram is never
+ * fragmented at IP level. Size receive buffers to at least this too: a stock
+ * server sends the same maximum. */
+#define MOCHE_MAX_DATAGRAM 1252
+
 /* Bits of moche_session_take_events. One-shot bits are cleared by the call;
  * level bits are reported on every call while the condition holds. */
 /* one-shot: the server rang the bell (the paint stream carries no BEL). */
