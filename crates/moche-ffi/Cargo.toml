@@ -13,3 +13,5 @@ crate-type = ["staticlib", "lib"]
 
 [dependencies]
 moche-core.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true

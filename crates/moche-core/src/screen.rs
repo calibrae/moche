@@ -133,6 +133,15 @@ impl Screen {
     }
 }
 
+/// Start of every paint: hide the cursor, reset SGR, the scroll region (`ESC[r`),
+/// origin mode (`?6l`) and set autowrap (`?7h`).
+pub const PAINT_PREAMBLE: &str = "\x1b[?25l\x1b[0m\x1b[r\x1b[?6l\x1b[?7h";
+
+/// DEC private modes a paint may switch on or off, besides the `?6`/`?7`
+/// resets of [`PAINT_PREAMBLE`]: cursor visibility, application cursor keys,
+/// mouse levels, mouse encodings and bracketed paste.
+pub const PAINT_MODES: [u16; 9] = [25, 1, 1000, 1002, 1003, 1005, 1006, 1015, 2004];
+
 fn is_blank(c: &Cell) -> bool {
     c.is_plain_blank()
 }
@@ -251,10 +260,17 @@ fn paint_row(out: &mut String, cells: &[Cell], r: usize, full: bool) {
 /// only rows that differ are rewritten (each ends with erase-to-end-of-line).
 /// Mode changes (application cursor keys, mouse mode and encoding, bracketed
 /// paste) and title changes are emitted as transitions against `prev`. The cursor
-/// is hidden while painting, then restored. Rows start from a known `ESC[0m` state.
+/// is hidden while painting, then restored.
+///
+/// The stream is self-contained for an arbitrary host terminal: every paint
+/// (full or partial) begins with [`PAINT_PREAMBLE`], which resets the state
+/// the repaint relies on, and every row is positioned absolutely (`CUP`). It
+/// never scrolls, never uses the alternate screen, and toggles only the modes
+/// in [`PAINT_MODES`] (plus the `?6`/`?7` resets of the preamble) and OSC 0/1/2
+/// titles.
 pub fn repaint(fb: &Framebuffer, prev: Option<&Framebuffer>) -> Vec<u8> {
     let mut o = String::new();
-    o.push_str("\x1b[?25l");
+    o.push_str(PAINT_PREAMBLE);
     let full = prev.is_none_or(|p| p.cols() != fb.cols() || p.rows() != fb.rows());
     paint_modes(&mut o, fb.modes(), prev.map(|p| p.modes()));
     if prev.is_none_or(|p| p.title() != fb.title()) && (prev.is_some() || !fb.title().is_empty()) {
@@ -266,7 +282,7 @@ pub fn repaint(fb: &Framebuffer, prev: Option<&Framebuffer>) -> Vec<u8> {
         let _ = write!(o, "\x1b]1;{}\x07", fb.icon_name());
     }
     if full {
-        o.push_str("\x1b[0m\x1b[?6l\x1b[?7h\x1b[r\x1b[2J");
+        o.push_str("\x1b[2J");
     }
     for r in 0..fb.rows() {
         let cells = fb.row_cells(r);
@@ -281,4 +297,136 @@ pub fn repaint(fb: &Framebuffer, prev: Option<&Framebuffer>) -> Vec<u8> {
         o.push_str("\x1b[?25h");
     }
     o.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Splits a paint into (csi final byte, params) and plain text runs.
+    #[derive(Debug, PartialEq)]
+    enum Tok {
+        Csi(String, char),
+        Osc(String),
+        Text(String),
+        Other(u8),
+    }
+
+    fn tokenize(b: &[u8]) -> Vec<Tok> {
+        let s = String::from_utf8(b.to_vec()).expect("paint is UTF-8");
+        let c: Vec<char> = s.chars().collect();
+        let (mut i, mut out) = (0, Vec::new());
+        while i < c.len() {
+            if c[i] == '\x1b' && c.get(i + 1) == Some(&'[') {
+                let mut j = i + 2;
+                while !c[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                out.push(Tok::Csi(c[i + 2..j].iter().collect(), c[j]));
+                i = j + 1;
+            } else if c[i] == '\x1b' && c.get(i + 1) == Some(&']') {
+                let j = i + c[i..].iter().position(|&x| x == '\x07').unwrap();
+                out.push(Tok::Osc(c[i + 2..j].iter().collect()));
+                i = j + 1;
+            } else if c[i] < ' ' || c[i] == '\x1b' {
+                out.push(Tok::Other(c[i] as u8));
+                i += 1;
+            } else {
+                let j = (i..c.len()).find(|&j| c[j] < ' ').unwrap_or(c.len());
+                out.push(Tok::Text(c[i..j].iter().collect()));
+                i = j;
+            }
+        }
+        out
+    }
+
+    fn busy() -> Framebuffer {
+        let mut f = Framebuffer::new(20, 6);
+        f.feed(
+            b"\x1b[2;5r\x1b[?6h\x1b[?7l\x1b[1;31mred\x1b[0m\r\nline2\x1b[?1h\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b]0;hello\x07\x1b[?25l",
+        );
+        f
+    }
+
+    fn check_self_contained(out: &[u8], rows_painted: usize) {
+        assert!(
+            out.starts_with(PAINT_PREAMBLE.as_bytes()),
+            "paint must start with the preamble: {:?}",
+            String::from_utf8_lossy(&out[..out.len().min(40)])
+        );
+        let toks = tokenize(out);
+        let mut positioned = false;
+        let mut cups = 0;
+        for t in &toks {
+            match t {
+                Tok::Csi(_, 'H') => {
+                    positioned = true;
+                    cups += 1;
+                }
+                Tok::Csi(p, c @ ('h' | 'l')) => {
+                    let n: u16 = p
+                        .strip_prefix('?')
+                        .unwrap_or_else(|| panic!("non-private mode {p}{c}"))
+                        .parse()
+                        .unwrap();
+                    assert!(
+                        PAINT_MODES.contains(&n) || (n == 6 && *c == 'l') || (n == 7 && *c == 'h'),
+                        "mode ?{n}{c} not allowed"
+                    );
+                }
+                // SGR, EL, ED, CHA, scroll region reset only; never scroll or alt screen
+                Tok::Csi(p, 'm') => assert!(!p.starts_with('?')),
+                Tok::Csi(p, 'r') => assert!(p.is_empty(), "scroll region must only be reset"),
+                Tok::Csi(_, 'K' | 'J' | 'G') => {}
+                Tok::Csi(p, c) => panic!("unexpected CSI {p}{c}"),
+                Tok::Osc(o) => assert!(
+                    o.starts_with("0;") || o.starts_with("1;") || o.starts_with("2;"),
+                    "osc {o}"
+                ),
+                Tok::Text(_) => assert!(positioned, "text before any absolute positioning"),
+                Tok::Other(b) => panic!("control byte {b:#x} (scrolling or movement) in paint"),
+            }
+        }
+        assert!(cups > rows_painted, "every row positioned (+ cursor cup)");
+        let s = String::from_utf8_lossy(out);
+        for bad in [
+            "?1049", "?47", "?1047", "\x1bD", "\x1bM", "\x1bE", "\x1b[S", "\x1b[T",
+        ] {
+            assert!(!s.contains(bad), "{bad} in paint");
+        }
+    }
+
+    #[test]
+    fn full_paint_is_self_contained() {
+        let fb = busy();
+        check_self_contained(&repaint(&fb, None), 0);
+    }
+
+    #[test]
+    fn partial_paint_is_self_contained() {
+        let a = busy();
+        let mut b = a.clone();
+        b.feed(b"\x1b[4;1Hnew text\x1b[?1l\x1b[?1003l\x1b[?1000h");
+        let out = repaint(&b, Some(&a));
+        check_self_contained(&out, 1);
+        // and an unchanged screen is still self-contained
+        check_self_contained(&repaint(&b, Some(&b)), 0);
+    }
+
+    #[test]
+    fn paint_recovers_a_dirty_host_terminal() {
+        let fb = busy();
+        let dirty = |h: &mut Framebuffer| h.feed(b"\x1b[3;4r\x1b[?6h\x1b[?7l\x1b[7;32m\x1b[2;2H");
+        let mut h = Framebuffer::new(20, 6);
+        dirty(&mut h);
+        h.feed(&repaint(&fb, None));
+        assert!(h.display_eq(&fb));
+        // partial paint after the host terminal was disturbed behind our back
+        let mut next = fb.clone();
+        next.feed(b"\x1b[6;1Hbottom");
+        dirty(&mut h);
+        h.feed(&repaint(&next, Some(&fb)));
+        assert!(h.display_eq(&next));
+        assert!(h.modes().autowrap && !h.modes().origin);
+    }
 }

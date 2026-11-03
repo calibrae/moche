@@ -13,15 +13,16 @@ publish = false
 [workspace.dependencies]
 moche-core = { path = "crates/moche-core" }
 base64 = "0.23"
-aes = "0.9"
+aes = { version = "0.9", features = ["zeroize"] }
 ocb3 = "0.2"
+zeroize = "1"
+getrandom = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # Small and self-contained: moche ships as an iOS static lib and a Mac CLI.
-# panic = "abort" also means a panic can never unwind across the FFI boundary.
+# No panic = "abort": moche-ffi catches panics at the C boundary (catch_unwind).
 [profile.release]
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = "symbols"

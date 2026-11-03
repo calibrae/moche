@@ -1,0 +1,4 @@
+module Moche [system] {
+    header "moche.h"
+    export *
+}

@@ -1,6 +1,7 @@
 //! Session key handling and (later) the packet cipher.
 
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+use zeroize::Zeroize;
 
 /// Length in bytes of the session key.
 pub const KEY_LEN: usize = 16;
@@ -28,7 +29,7 @@ impl std::fmt::Display for KeyError {
 
 impl std::error::Error for KeyError {}
 
-/// The 128-bit shared secret from `MOSH CONNECT <port> <key>`.
+/// The 128-bit shared secret from `MOSH CONNECT <port> <key>`. Wiped on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Session {
     key: [u8; KEY_LEN],
@@ -41,14 +42,26 @@ impl Session {
         if s.len() != KEY_B64_LEN {
             return Err(KeyError::BadLength(s.len()));
         }
-        let bytes = STANDARD_NO_PAD.decode(s).map_err(|_| KeyError::BadBase64)?;
-        let key: [u8; KEY_LEN] = bytes.try_into().map_err(|_| KeyError::BadBase64)?;
+        let mut bytes = STANDARD_NO_PAD.decode(s).map_err(|_| KeyError::BadBase64)?;
+        let mut key = [0u8; KEY_LEN];
+        if bytes.len() != KEY_LEN {
+            bytes.zeroize();
+            return Err(KeyError::BadBase64);
+        }
+        key.copy_from_slice(&bytes);
+        bytes.zeroize();
         Ok(Session { key })
     }
 
     /// Raw key bytes.
     pub fn key(&self) -> &[u8; KEY_LEN] {
         &self.key
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.key.zeroize();
     }
 }
 
