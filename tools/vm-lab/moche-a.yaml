@@ -1,0 +1,25 @@
+# moche test lab VM (moche-a). No host mounts, no containerd, vzNAT shared network.
+vmType: vz
+cpus: 2
+memory: 2GiB
+disk: 12GiB
+images:
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: aarch64
+mounts: []
+containerd:
+  system: false
+  user: false
+# vzNAT: host<->VM reachable (lima0), but VMs cannot reach each other on it (L2 isolated).
+# user-v2: VM<->VM reachable (eth0), not reachable from the host directly.
+networks:
+  - vzNAT: true
+  - lima: user-v2
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y mosh tcpdump iproute2 iptables nftables vim htop tmux curl ca-certificates openssh-server git
