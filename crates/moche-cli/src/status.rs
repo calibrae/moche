@@ -45,22 +45,35 @@ pub enum StatusUpdate {
 /// Decides when to show, refresh or clear the status line.
 #[derive(Default)]
 pub struct Status {
-    shown_secs: Option<u64>,
+    shown: Option<String>,
 }
 
 impl Status {
-    pub fn update(&mut self, silent_ms: u64) -> StatusUpdate {
-        if silent_ms >= SILENCE_MS {
-            let secs = silent_ms / 1000;
-            if self.shown_secs == Some(secs) {
-                return StatusUpdate::None;
-            }
-            self.shown_secs = Some(secs);
-            StatusUpdate::Show(format!("moche: connection lost, last contact {secs} s ago"))
-        } else if self.shown_secs.take().is_some() {
-            StatusUpdate::Clear
+    /// The text currently on screen, if any.
+    pub fn shown(&self) -> Option<&str> {
+        self.shown.as_deref()
+    }
+
+    /// `silent_ms`: time since the server was last heard; `desync`: a diff
+    /// could not be applied. Silence wins over desync.
+    pub fn update(&mut self, silent_ms: u64, desync: bool) -> StatusUpdate {
+        let want = if silent_ms >= SILENCE_MS {
+            Some(format!(
+                "moche: connection lost, last contact {} s ago",
+                silent_ms / 1000
+            ))
+        } else if desync {
+            Some("moche: out of sync".to_string())
         } else {
-            StatusUpdate::None
+            None
+        };
+        if want == self.shown {
+            return StatusUpdate::None;
+        }
+        self.shown = want.clone();
+        match want {
+            Some(t) => StatusUpdate::Show(t),
+            None => StatusUpdate::Clear,
         }
     }
 }
@@ -103,16 +116,23 @@ mod tests {
     #[test]
     fn status_lifecycle() {
         let mut s = Status::default();
-        assert_eq!(s.update(1000), StatusUpdate::None);
-        assert_eq!(s.update(4999), StatusUpdate::None);
+        assert_eq!(s.update(1000, false), StatusUpdate::None);
+        assert_eq!(s.update(4999, false), StatusUpdate::None);
         assert_eq!(
-            s.update(5000),
+            s.update(5000, false),
             StatusUpdate::Show("moche: connection lost, last contact 5 s ago".into())
         );
-        assert_eq!(s.update(5400), StatusUpdate::None);
-        assert!(matches!(s.update(6000), StatusUpdate::Show(t) if t.contains("6 s")));
-        assert_eq!(s.update(10), StatusUpdate::Clear);
-        assert_eq!(s.update(20), StatusUpdate::None);
+        assert_eq!(s.update(5400, false), StatusUpdate::None);
+        assert!(matches!(s.update(6000, false), StatusUpdate::Show(t) if t.contains("6 s")));
+        assert_eq!(s.update(10, false), StatusUpdate::Clear);
+        assert_eq!(s.update(20, false), StatusUpdate::None);
+        assert_eq!(
+            s.update(20, true),
+            StatusUpdate::Show("moche: out of sync".into())
+        );
+        assert!(matches!(s.update(7000, true), StatusUpdate::Show(t) if t.contains("lost")));
+        assert_eq!(s.update(7000, false), StatusUpdate::None);
+        assert_eq!(s.update(0, false), StatusUpdate::Clear);
     }
 
     #[test]

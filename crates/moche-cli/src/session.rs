@@ -159,9 +159,19 @@ pub fn run(
         if size != (cols, rows) {
             (cols, rows) = size;
             transport.send_resize(now(), cols, rows);
+            display.on_local_resize();
         }
 
-        match status.update(now().saturating_sub(last_contact)) {
+        let out = display.flush();
+        if !out.is_empty() {
+            term::write_tty(&out);
+            // The repaint may have covered the status row.
+            if let Some(t) = status.shown() {
+                term::write_tty(&draw_status(t, cols, rows));
+            }
+        }
+
+        match status.update(now().saturating_sub(last_contact), display.out_of_sync()) {
             StatusUpdate::None => {}
             StatusUpdate::Show(text) => term::write_tty(&draw_status(&text, cols, rows)),
             StatusUpdate::Clear => {

@@ -12,11 +12,6 @@ publish.workspace = true
 name = "moche"
 path = "src/main.rs"
 
-[features]
-# TODO(screen): enable once moche_core::screen::Screen lands; swaps the
-# passthrough display for the real framebuffer-backed one (see display.rs).
-screen = []
-
 [dependencies]
 moche-core.workspace = true
 rustix = { version = "1.1", features = ["termios", "event", "stdio"] }

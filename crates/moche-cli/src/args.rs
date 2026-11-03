@@ -47,6 +47,8 @@ pub struct Opts {
     pub server: String,
     pub port_range: Option<String>,
     pub altscreen: bool,
+    /// Hidden debug option: write host diffs straight to the tty.
+    pub passthrough: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +65,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut server = "mosh-server".to_string();
     let mut port_range = None;
     let mut altscreen = true;
+    let mut passthrough = false;
     let mut direct: Option<(String, u16)> = None;
     let mut key_stdin = false;
     let mut host: Option<String> = None;
@@ -87,6 +90,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 port_range = Some(r);
             }
             "--no-altscreen" => altscreen = false,
+            "--passthrough" => passthrough = true,
             "--key-stdin" => key_stdin = true,
             "--direct" => {
                 let h = val(&mut it, "--direct")?;
@@ -134,6 +138,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         server,
         port_range,
         altscreen,
+        passthrough,
     })))
 }
 

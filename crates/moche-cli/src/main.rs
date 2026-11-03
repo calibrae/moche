@@ -82,7 +82,7 @@ fn main() -> ExitCode {
         Err(e) => return fail(EXIT_ERROR, &e),
     };
     let (cols, rows) = term::size();
-    let mut display = display::make_display(cols, rows);
+    let mut display = display::make_display(opts.passthrough, cols, rows);
     let result = session::run(&session, addr, display.as_mut(), &signals);
     drop(guard);
 
