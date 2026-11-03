@@ -326,6 +326,12 @@ impl Rtt {
         self.est.map_or(1000.0, |(s, _)| s)
     }
 
+    /// Round-trip variation in ms; half the first-sample RTT before any (so
+    /// 500 before the first sample).
+    pub fn rttvar_ms(&self) -> f64 {
+        self.est.map_or(500.0, |(_, v)| v)
+    }
+
     /// Retransmission timeout in ms: `srtt + 4 * rttvar`, clamped to 50..=1000.
     pub fn rto_ms(&self) -> f64 {
         self.est

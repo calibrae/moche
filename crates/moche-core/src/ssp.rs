@@ -5,20 +5,40 @@
 //!
 //! Sending: user input is a numbered stream of elements. Each frame carries
 //! the cumulative diff from the last state the server acked to the latest one
-//! (so any lost frame is repaired by the next), bounded to `MAX_STATE_BYTES`
+//! (so any lost frame is repaired by the next), bounded to `state_limit` bytes
 //! of raw input: a state is any prefix of the input stream, so a larger backlog
-//! goes out as a chain of states, each acked before the next is cut. The cap
-//! (`state_limit`) is adaptive: it starts at `MAX_STATE_BYTES`, halves (floor
-//! `MIN_STATE_BYTES`) when the unacked state has been sent twice without an
-//! ack, and doubles after a state is acked at its first send. When it shrinks
-//! below the unacked state's size, that state number is abandoned and a new,
-//! smaller one (fresh number, cumulative diff from the acked state) is sent.
+//! goes out as a chain of states, each acked before the next is cut.
+//!
+//! **Invariant (B2, observed against a stock mosh-server 1.4.0, cause
+//! inferred; `docs/observations-round5.md`, `docs/protocol.md` section 4):**
+//! for any two states ever sent, `new_num_a < new_num_b` implies the content
+//! of `b` extends the content of `a` (the input length is non-decreasing in
+//! `new_num`), and a resend of a number carries the same cumulative content as
+//! its first send. A state that is in flight is therefore NEVER abandoned,
+//! shrunk or re-cut: it is resent unchanged (same `new_num`, same content)
+//! until acked. Everything here follows from sending only prefixes of one
+//! stream, cut at a non-decreasing point.
+//!
+//! The cap (`state_limit`) is adaptive and applies ONLY to the next cut, never
+//! to a state already out. It starts at the floor `MIN_STATE_BYTES` (slow
+//! start: a state is resent whole until every fragment of one copy gets
+//! through, which costs about `1 / 0.9^fragments` copies at 10% loss, so a
+//! 64 KiB first state would be hopeless and, unlike before, cannot be re-cut
+//! once out) and doubles up to `MAX_STATE_BYTES`. A big in-flight
+//! state counts as lost-suspected when it has been sent at least three times
+//! and a full loss RTO (`max(MIN_LOSS_RTO_MS, 1.5 * srtt + 4 * rttvar + ACK_DELAY_MS)`)
+//! has passed since its first send without an ack: the cap then halves (floor
+//! `MIN_STATE_BYTES`), once per state, so latency alone (acks arrive within
+//! that RTO) never shrinks it. The halved cap persists: it doubles again only
+//! after `GROW_AFTER_CLEAN` consecutive acked-at-first-send states that
+//! filled at least half the cap. While a big state is in flight no new state
+//! is cut, so the cap chosen before the state went out is what bounds its cost.
 //!
 //! Unacked data is re-sent with a fresh datagram sequence number and fragment
 //! id, reusing the same `new_num`. Small frames (at most `BIG_STATE_BYTES`
 //! of already-sent raw input outstanding) are re-sent every frame slot (about
 //! SRTT/2, at least 20 ms); a big outstanding state is re-sent at most once
-//! per RTO (100 ms to 1 s). Idle, an empty frame (with a fresh `new_num`) goes
+//! per RTO plus the delayed ack (100 ms to 1 s). Idle, an empty frame (with a fresh `new_num`) goes
 //! out as a delayed ack after 100 ms, or as a heartbeat after 3 s.
 //!
 //! Receiving: the transport tracks which server state numbers it can
@@ -57,10 +77,11 @@ const HEARTBEAT_MS: u64 = 3000;
 /// fragments, far below the fragment cap, so a frame is always buildable.
 pub const MAX_STATE_BYTES: usize = 64 * 1024;
 /// Floor of the adaptive state size.
-pub const MIN_STATE_BYTES: usize = 8 * 1024;
+pub const MIN_STATE_BYTES: usize = 16 * 1024;
 /// Largest single `Data` element. Big `send_keys` calls are cut into pieces of
-/// this size so every cut point (state boundary) is at most this far apart
-/// (and a state at the floor holds at least two pieces).
+/// this size: it is the cut granularity, so a state at the floor holds four
+/// pieces and fills at least 75% of the cap (a coarser piece would waste the
+/// cap, a finer one only adds elements).
 const CHUNK_BYTES: usize = 4 * 1024;
 /// A sent-and-unacked state with more raw data than this is re-sent at most
 /// once per RTO instead of every frame slot.
@@ -68,6 +89,14 @@ const BIG_STATE_BYTES: usize = 4 * 1024;
 /// Bounds of the resend interval for a big state, in ms.
 const MIN_RTO_MS: u64 = 100;
 const MAX_RTO_MS: u64 = 1000;
+/// Loss-suspicion timeout: floor and ceiling in ms. The floor sits above the
+/// server's delayed ack (about 100 ms, up to about 220 ms seen at the start of
+/// lossy sessions), so a LAN ack that merely waits for it is not a loss.
+const MIN_LOSS_RTO_MS: u64 = 250;
+const MAX_LOSS_RTO_MS: u64 = 3000;
+/// Consecutive clean (acked at first send, cap-filling) states before the cap
+/// doubles back after a shrink.
+const GROW_AFTER_CLEAN: u32 = 2;
 
 /// Source of random bytes supplied by the host (used for chaff only).
 pub type Rng = Box<dyn FnMut(&mut [u8]) + Send>;
@@ -123,14 +152,20 @@ pub struct Transport {
     rx_errors: u64,
     /// Sent states as `(num, element count)`; the front is the acked state.
     sent: VecDeque<(u64, u64)>,
-    /// Next state number to hand out (numbers of abandoned states are not reused).
+    /// Next state number to hand out.
     next_num: u64,
     /// Current cap of raw input bytes per state.
     state_limit: usize,
+    /// Times loss suspicion halved (or tried to halve) the cap.
+    cap_shrinks: u64,
     /// Times the newest unacked state has been sent (0 when none is unacked).
     sends: u32,
-    /// `sends` at the last shrink: another shrink needs two more sends.
-    shrink_mark: u32,
+    /// When the newest state was first sent.
+    first_sent: u64,
+    /// The newest state already caused a shrink (at most one per state).
+    shrunk: bool,
+    /// Consecutive clean cap-filling acks since the last shrink.
+    clean_acks: u32,
     unsent_since: Option<u64>,
     last_send: Option<u64>,
     outbox: VecDeque<Vec<u8>>,
@@ -168,9 +203,12 @@ impl Transport {
             rx_errors: 0,
             sent: VecDeque::from([(0, 0)]),
             next_num: 1,
-            state_limit: MAX_STATE_BYTES,
+            state_limit: MIN_STATE_BYTES,
+            cap_shrinks: 0,
             sends: 0,
-            shrink_mark: 0,
+            first_sent: 0,
+            shrunk: false,
+            clean_acks: 0,
             unsent_since: None,
             last_send: None,
             outbox: VecDeque::new(),
@@ -223,6 +261,11 @@ impl Transport {
     /// Current cap of raw input bytes per sent state (adaptive).
     pub fn state_limit(&self) -> usize {
         self.state_limit
+    }
+
+    /// Number of states suspected lost (each halves the cap, down to its floor).
+    pub fn cap_shrinks(&self) -> u64 {
+        self.cap_shrinks
     }
 
     /// Server state numbers held (ascending); `Screen::held` has the same.
@@ -380,15 +423,23 @@ impl Transport {
             return;
         };
         let was_newest = p + 1 == self.sent.len();
-        self.sent.drain(..p);
         if was_newest {
-            // Everything sent is acked: grow after a first-send ack.
-            if self.sends == 1 {
-                self.state_limit = (self.state_limit * 2).min(MAX_STATE_BYTES);
+            // Everything sent is acked. Grow only after clean first-send acks
+            // of states that filled the cap (a keystroke ack proves nothing).
+            let size = self.bytes_to(self.last_count());
+            if self.sends == 1 && size * 2 >= self.state_limit {
+                self.clean_acks += 1;
+                if self.clean_acks >= GROW_AFTER_CLEAN && self.state_limit < MAX_STATE_BYTES {
+                    self.state_limit = (self.state_limit * 2).min(MAX_STATE_BYTES);
+                    self.clean_acks = 0;
+                }
+            } else if self.sends > 1 {
+                self.clean_acks = 0;
             }
             self.sends = 0;
-            self.shrink_mark = 0;
+            self.shrunk = false;
         }
+        self.sent.drain(..p);
         let count = self.sent[0].1;
         let drop = ((count - self.acked_count) as usize).min(self.elements.len());
         for e in self.elements.drain(..drop) {
@@ -439,22 +490,46 @@ impl Transport {
         self.last_count() > self.acked_count && self.bytes_to(self.last_count()) > BIG_STATE_BYTES
     }
 
+    /// RTO plus the server's delayed ack: an ack for a big state cannot be
+    /// expected sooner, and resending before it arrives only burns bandwidth.
     fn big_resend_interval(&self) -> u64 {
-        (self.rtt.rto_ms().ceil() as u64).clamp(MIN_RTO_MS, MAX_RTO_MS)
+        ((self.rtt.rto_ms() + ACK_DELAY_MS as f64).ceil() as u64).clamp(MIN_RTO_MS, MAX_RTO_MS)
     }
 
-    /// Halves the cap when the newest state went out twice unacked, and
-    /// abandons unacked states that no longer fit under it.
-    fn maybe_shrink(&mut self) {
-        if self.last_count() > self.acked_count
-            && self.sends >= self.shrink_mark + 2
-            && self.state_limit > MIN_STATE_BYTES
-        {
-            self.state_limit = (self.state_limit / 2).max(MIN_STATE_BYTES);
-            self.shrink_mark = self.sends;
-            while self.sent.len() > 1 && self.bytes_to(self.last_count()) > self.state_limit {
-                self.sent.pop_back();
-            }
+    /// Loss-suspicion timeout in ms, from measured values: the time an ack
+    /// of a state may legitimately take (RTT with margin, plus the server's
+    /// delayed ack).
+    fn loss_rto_ms(&self) -> u64 {
+        let v = 1.5 * self.rtt.srtt_ms() + 4.0 * self.rtt.rttvar_ms() + ACK_DELAY_MS as f64;
+        (v.ceil() as u64).clamp(MIN_LOSS_RTO_MS, MAX_LOSS_RTO_MS)
+    }
+
+    /// Called on each resend of the newest state. Halves the cap, for the
+    /// NEXT cut only, when that (big) state has been sent three times and a
+    /// full loss RTO has passed since its first send. The state in flight is
+    /// never touched (see the module invariant).
+    fn note_resend(&mut self, now_ms: u64) {
+        if self.shrunk || !self.outstanding_big() || self.sends < 3 {
+            return;
+        }
+        if now_ms.saturating_sub(self.first_sent) < self.loss_rto_ms() {
+            return;
+        }
+        self.shrunk = true;
+        self.cap_shrinks += 1;
+        self.clean_acks = 0;
+        self.state_limit = (self.state_limit / 2).max(MIN_STATE_BYTES);
+    }
+
+    /// Element count the next frame carries: the newest sent state again
+    /// while a big state is in flight (never re-cut), else the longest prefix
+    /// under the cap, never less than what was already sent.
+    fn cut_target(&self) -> u64 {
+        let last = self.last_count();
+        if self.outstanding_big() {
+            last
+        } else {
+            self.cut_count().max(last)
         }
     }
 
@@ -484,7 +559,7 @@ impl Transport {
                 self.frame_interval()
             };
             let by_interval = self.last_send.map(|t| t + pace);
-            let mut t = if self.cut_count() > self.last_count() {
+            let mut t = if self.cut_target() > self.last_count() {
                 let collect = self.unsent_since.unwrap_or(0) + COLLECT_MS;
                 by_interval.map_or(collect, |b| b.max(collect))
             } else {
@@ -515,9 +590,8 @@ impl Transport {
     fn build_frame(&mut self, now_ms: u64) {
         let old_num = self.sent[0].0;
         let (new_num, diff) = if self.data_outstanding() {
-            self.maybe_shrink();
             let last_num = self.sent.back().map_or(0, |s| s.0);
-            let cut = self.cut_count().max(self.last_count());
+            let cut = self.cut_target();
             let n_el = (cut - self.acked_count) as usize;
             let diff = encode_diff(&coalesce(self.elements.iter().take(n_el)));
             if cut > self.last_count() {
@@ -525,11 +599,13 @@ impl Transport {
                 self.next_num += 1;
                 self.sent.push_back((n, cut));
                 self.sends = 1;
-                self.shrink_mark = 0;
+                self.first_sent = now_ms;
+                self.shrunk = false;
                 self.unsent_since = (self.total > cut).then_some(now_ms);
                 (n, diff)
             } else {
                 self.sends += 1;
+                self.note_resend(now_ms);
                 (last_num, diff)
             }
         } else {
@@ -717,7 +793,7 @@ mod tests {
                 total += 1;
             }
         }
-        assert!(total > 100, "expected many fragments, got {total}");
+        assert!(total > 20, "expected many fragments, got {total}");
         assert_eq!(t.send_errors(), 0);
         // only the first bounded state is in flight, not the whole megabyte
         assert!(total < 6 * 70, "too many fragments: {total}");
@@ -1013,18 +1089,100 @@ mod tests {
             .collect()
     }
 
-    /// Server model: reassembles what the client sends, checks the state
-    /// chain, rebuilds the stream and produces acks.
+    /// Server model of the stock server's apparent receiver rule (B2,
+    /// inferred, see `docs/observations-round5.md`): every newer state must
+    /// extend every older one, and a number resent must carry the same
+    /// content. It PANICS when the transport breaks that. Holds one master
+    /// copy of the stream plus (length, resizes) per state, so memory is
+    /// the payload, not payload times states.
+    #[derive(Default)]
+    struct Model {
+        master: Vec<u8>,
+        /// state num -> (data bytes, resize count) of its content
+        states: std::collections::BTreeMap<u64, (usize, usize)>,
+        accepted: usize,
+    }
+
+    impl Model {
+        fn new() -> Self {
+            Model {
+                states: std::collections::BTreeMap::from([(0, (0, 0))]),
+                ..Default::default()
+            }
+        }
+
+        /// Applies one client instruction; returns its `new_num`.
+        fn accept(&mut self, i: &Instruction) -> u64 {
+            assert!(
+                i.old_num < i.new_num,
+                "old {} >= new {}",
+                i.old_num,
+                i.new_num
+            );
+            let (mut len, mut rs) = *self.states.get(&i.old_num).expect("unknown base");
+            for e in decode_diff(&i.diff).unwrap() {
+                match e {
+                    Element::Data(b) => {
+                        let end = len + b.len();
+                        if end <= self.master.len() {
+                            assert_eq!(
+                                self.master[len..end],
+                                b[..],
+                                "content diverges from the stream"
+                            );
+                        } else {
+                            let have = self.master.len().saturating_sub(len);
+                            assert_eq!(self.master[len..len + have], b[..have], "content diverges");
+                            self.master.extend_from_slice(&b[have..]);
+                        }
+                        len = end;
+                    }
+                    Element::Resize { .. } => rs += 1,
+                    Element::EchoAck(_) => {}
+                }
+            }
+            let content = (len, rs);
+            if let Some(prev) = self.states.get(&i.new_num) {
+                assert_eq!(
+                    *prev, content,
+                    "B2: state {} resent with different content",
+                    i.new_num
+                );
+            } else {
+                if let Some((m, c)) = self.states.range(..i.new_num).next_back() {
+                    assert!(
+                        c.0 <= len && c.1 <= rs,
+                        "B2: state {} ({len} B) does not extend state {m} ({} B)",
+                        i.new_num,
+                        c.0
+                    );
+                }
+                if let Some((m, c)) = self.states.range(i.new_num + 1..).next() {
+                    assert!(
+                        len <= c.0 && rs <= c.1,
+                        "B2: state {} ({len} B) is longer than later state {m} ({} B)",
+                        i.new_num,
+                        c.0
+                    );
+                }
+                self.states.insert(i.new_num, content);
+            }
+            self.accepted += 1;
+            i.new_num
+        }
+
+        fn stream_at(&self, num: u64) -> &[u8] {
+            &self.master[..self.states[&num].0]
+        }
+    }
+
     struct Sim {
         srv: Server,
         reasm: Reassembler,
-        /// state num -> data bytes of the stream up to that state
-        states: std::collections::BTreeMap<u64, Vec<u8>>,
-        resizes: usize,
+        model: Model,
         acked: u64,
         reply_num: u64,
         datagrams: usize,
-        last_new: u64,
     }
 
     impl Sim {
@@ -1032,12 +1190,10 @@ mod tests {
             Sim {
                 srv: Server::new(),
                 reasm: Reassembler::new(),
-                states: std::collections::BTreeMap::from([(0, Vec::new())]),
-                resizes: 0,
+                model: Model::new(),
                 acked: 0,
                 reply_num: 0,
                 datagrams: 0,
-                last_new: 0,
             }
         }
 
@@ -1049,30 +1205,8 @@ mod tests {
             let Some(msg) = self.reasm.push(inner.frag).unwrap() else {
                 return;
             };
-            let i = Instruction::decode(&msg).unwrap();
-            assert!(i.old_num < i.new_num);
-            assert!(i.new_num >= self.last_new, "new_num went backwards");
-            self.last_new = i.new_num;
-            let base = self.states.get(&i.old_num).expect("unknown base").clone();
-            let mut stream = base;
-            for e in decode_diff(&i.diff).unwrap() {
-                match e {
-                    Element::Data(b) => stream.extend_from_slice(&b),
-                    Element::Resize { .. } => self.resizes += 1,
-                    Element::EchoAck(_) => {}
-                }
-            }
-            match self.states.get(&i.new_num) {
-                Some(prev) => {
-                    assert_eq!(*prev, stream, "state {} changed", i.new_num)
-                }
-                None => {
-                    self.states.insert(i.new_num, stream);
-                }
-            }
-            if i.new_num > self.acked {
-                self.acked = i.new_num;
-            }
+            let n = self.model.accept(&Instruction::decode(&msg).unwrap());
+            self.acked = self.acked.max(n);
         }
 
         fn ack_datagram(&mut self) -> Vec<u8> {
@@ -1082,7 +1216,7 @@ mod tests {
         }
 
         fn stream(&self) -> &[u8] {
-            &self.states[&self.acked]
+            self.model.stream_at(self.acked)
         }
     }
 
@@ -1129,7 +1263,9 @@ mod tests {
 
     #[test]
     fn big_incompressible_send_keys_is_fully_delivered() {
-        for (len, seed) in [(1 << 20, 5u64), (16 << 20, 6)] {
+        // The server model keeps one copy of the stream, so 4 MiB costs about
+        // 4 MiB (the old per-state copies needed 1.7 GB for 16 MiB).
+        for (len, seed) in [(1 << 20, 5u64), (4 << 20, 6)] {
             let data = noise(seed, len);
             let mut t = transport();
             let mut sim = Sim::new();
@@ -1434,6 +1570,33 @@ mod tests {
         bytes: usize,
         datagrams: usize,
         limit: usize,
+        shrinks: u64,
+    }
+
+    /// Behaviour of the virtual link, percentages per datagram.
+    #[derive(Clone, Copy)]
+    struct LinkCfg {
+        loss_up: u64,
+        loss_down: u64,
+        one_way: u64,
+        /// Extra random delay 0..=jitter per datagram (reorders).
+        jitter: u64,
+        dup: u64,
+        /// The server holds each ack this long (its delayed-ack timer).
+        ack_hold: u64,
+    }
+
+    impl LinkCfg {
+        fn new(loss: u64, one_way: u64) -> Self {
+            LinkCfg {
+                loss_up: loss,
+                loss_down: loss,
+                one_way,
+                jitter: 0,
+                dup: 0,
+                ack_hold: 0,
+            }
+        }
     }
 
     /// Pushes `payload` through a virtual-clock link: `loss_pct` percent loss
@@ -1441,8 +1604,17 @@ mod tests {
     /// complete instruction at once (echoing our timestamps so the transport
     /// learns the RTT). Returns what the client sent.
     fn link_sim(payload: &[u8], loss_pct: u64, one_way: u64, seed: u64) -> LinkResult {
+        link_sim_cfg(&[(0, payload)], LinkCfg::new(loss_pct, one_way), seed)
+    }
+
+    /// Like `link_sim` with a typing script `(time, bytes)` and a full link
+    /// config. Two server models run: one sees every datagram the transport
+    /// EMITS in emission order (the invariant holds for everything ever sent),
+    /// one sees what the link delivers (reordered, duplicated). Both panic on
+    /// a B2 violation.
+    fn link_sim_cfg(script: &[(u64, &[u8])], cfg: LinkCfg, seed: u64) -> LinkResult {
         use std::cmp::Reverse;
-        use std::collections::{BTreeMap, BinaryHeap};
+        use std::collections::BinaryHeap;
         let mut r = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let mut rnd = move |m: u64| {
             r = r
@@ -1450,16 +1622,19 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (r >> 33) % m
         };
+        let want: Vec<u8> = script.iter().flat_map(|(_, b)| b.iter().copied()).collect();
         let mut srv = Server::new();
         let mut t = transport();
         let mut reasm = Reassembler::new();
-        let mut states: BTreeMap<u64, Vec<u8>> = BTreeMap::from([(0, Vec::new())]);
+        let mut emit_reasm = Reassembler::new();
+        let mut model = Model::new();
+        let mut emit_model = Model::new();
         let (mut acked, mut reply_num) = (0u64, 0u64);
         let mut to_srv: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> = BinaryHeap::new();
         let mut to_cli: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> = BinaryHeap::new();
         let mut ctr = 0u64;
         let (mut now, mut bytes, mut datagrams) = (0u64, 0usize, 0usize);
-        t.send_keys(0, payload);
+        let mut next_script = 0usize;
         for _ in 0..5_000_000 {
             let mut next = u64::MAX;
             for q in [&to_srv, &to_cli] {
@@ -1467,11 +1642,18 @@ mod tests {
                     next = next.min(*tm);
                 }
             }
+            if let Some((tm, _)) = script.get(next_script) {
+                next = next.min(*tm);
+            }
             if let Some(d) = t.next_deadline_ms() {
                 next = next.min(d.max(now));
             }
             assert!(next < 3_600_000, "no convergence in an hour of link time");
             now = next.max(now);
+            while script.get(next_script).is_some_and(|(tm, _)| *tm <= now) {
+                t.send_keys(now, script[next_script].1);
+                next_script += 1;
+            }
             while to_srv.peek().is_some_and(|Reverse((tm, ..))| *tm <= now) {
                 let Reverse((_, _, d)) = to_srv.pop().unwrap();
                 let o = srv.cipher.open(&d).unwrap();
@@ -1480,25 +1662,15 @@ mod tests {
                 let Some(msg) = reasm.push(inner.frag).unwrap() else {
                     continue;
                 };
-                let i = Instruction::decode(&msg).unwrap();
-                let mut stream = states.get(&i.old_num).expect("unknown base").clone();
-                for e in decode_diff(&i.diff).unwrap() {
-                    if let Element::Data(b) = e {
-                        stream.extend_from_slice(&b);
-                    }
-                }
-                if let Some(prev) = states.get(&i.new_num) {
-                    assert_eq!(*prev, stream, "state {} changed", i.new_num);
-                } else {
-                    states.insert(i.new_num, stream);
-                }
-                acked = acked.max(i.new_num);
+                acked = acked.max(model.accept(&Instruction::decode(&msg).unwrap()));
                 reply_num += 1;
                 let reply = Server::instr(0, reply_num, acked, &[]);
-                for d in srv.send(0, Some(ts), reply) {
-                    if rnd(100) >= loss_pct {
+                let hold = cfg.ack_hold;
+                for d in srv.send(0, Some(ts.wrapping_add(hold as u16)), reply) {
+                    if rnd(100) >= cfg.loss_down {
                         ctr += 1;
-                        to_cli.push(Reverse((now + one_way, ctr, d)));
+                        let at = now + hold + cfg.one_way + rnd(cfg.jitter + 1);
+                        to_cli.push(Reverse((at, ctr, d)));
                     }
                 }
             }
@@ -1509,18 +1681,31 @@ mod tests {
             while let Some(d) = t.poll_transmit(now) {
                 bytes += d.len();
                 datagrams += 1;
-                if rnd(100) >= loss_pct {
-                    ctr += 1;
-                    to_srv.push(Reverse((now + one_way, ctr, d)));
+                let o = srv.cipher.open(&d).unwrap();
+                let inner = Inner::decode(&o.plaintext).unwrap();
+                if let Some(msg) = emit_reasm.push(inner.frag).unwrap() {
+                    emit_model.accept(&Instruction::decode(&msg).unwrap());
+                }
+                let copies = 1 + usize::from(rnd(100) < cfg.dup);
+                for _ in 0..copies {
+                    if rnd(100) >= cfg.loss_up {
+                        ctr += 1;
+                        let at = now + cfg.one_way + rnd(cfg.jitter + 1);
+                        to_srv.push(Reverse((at, ctr, d.clone())));
+                    }
                 }
             }
-            if states[&acked] == payload && t.queued_bytes() == 0 {
+            if next_script == script.len()
+                && model.stream_at(acked) == want
+                && t.queued_bytes() == 0
+            {
                 assert_eq!(t.send_errors(), 0);
                 return LinkResult {
                     ms: now,
                     bytes,
                     datagrams,
                     limit: t.state_limit(),
+                    shrinks: t.cap_shrinks(),
                 };
             }
         }
@@ -1558,44 +1743,223 @@ mod tests {
         );
     }
 
+    fn open_all(srv: &Server, out: &[Vec<u8>]) -> Instruction {
+        let mut r = Reassembler::new();
+        let mut msg = None;
+        for d in out {
+            let o = srv.cipher.open(d).unwrap();
+            let inner = Inner::decode(&o.plaintext).unwrap();
+            msg = r.push(inner.frag).unwrap().or(msg);
+        }
+        Instruction::decode(&msg.unwrap()).unwrap()
+    }
+
+    /// The exact B2 repro: state 1 (big) is in flight, the loss trigger fires
+    /// and the cap halves. The next frame must be state 1 again, unchanged
+    /// (never a new number with less data); the smaller cap only shapes the
+    /// cut after the ack, which must extend state 1.
     #[test]
-    fn state_limit_halves_after_two_unacked_sends_and_regrows() {
+    fn b2_shrink_never_recuts_the_state_in_flight() {
+        let mut srv = Server::new();
+        let mut model = Model::new();
+        let mut t = transport();
+        let data = noise(5, 400_000);
+        t.send_keys(0, &data);
+        assert_eq!(t.state_limit(), MIN_STATE_BYTES, "slow start");
+        t.state_limit = MAX_STATE_BYTES; // as after a clean run of acks
+        let mut now = 8;
+        let first = open_all(&srv, &drain(&mut t, now));
+        assert_eq!((first.old_num, first.new_num), (0, 1));
+        model.accept(&first);
+        let first_len = decode_diff(&first.diff)
+            .unwrap()
+            .iter()
+            .map(|e| match e {
+                Element::Data(b) => b.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert!(first_len > MAX_STATE_BYTES / 2);
+        let mut shrunk = false;
+        for _ in 0..20 {
+            now = t.next_deadline_ms().unwrap();
+            let i = open_all(&srv, &drain(&mut t, now));
+            model.accept(&i); // panics if state 1 changed or a shorter newer state appears
+            assert_eq!(
+                (i.old_num, i.new_num),
+                (0, 1),
+                "the state in flight is resent as is"
+            );
+            assert_eq!(i.diff, first.diff);
+            if t.state_limit() < MAX_STATE_BYTES {
+                shrunk = true;
+                break;
+            }
+        }
+        assert!(shrunk, "sustained silence must be suspected as loss");
+        assert!(now >= MIN_LOSS_RTO_MS, "not before a full loss RTO: {now}");
+        assert_eq!(t.state_limit(), MAX_STATE_BYTES / 2);
+        // one more resend after the shrink: still state 1
+        now = t.next_deadline_ms().unwrap();
+        let i = open_all(&srv, &drain(&mut t, now));
+        assert_eq!((i.old_num, i.new_num), (0, 1));
+        assert_eq!(i.diff, first.diff);
+        // ack: the next cut uses the halved cap and extends state 1
+        t.handle_datagram(now + 10, &srv.send(0, None, Server::instr(0, 1, 1, &[]))[0]);
+        let next = t.next_deadline_ms().unwrap();
+        let i = open_all(&srv, &drain(&mut t, next));
+        model.accept(&i);
+        assert_eq!((i.old_num, i.new_num), (1, 2));
+        let len2: usize = decode_diff(&i.diff)
+            .unwrap()
+            .iter()
+            .map(|e| match e {
+                Element::Data(b) => b.len(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            len2 <= MAX_STATE_BYTES / 2 && len2 > MIN_STATE_BYTES / 2,
+            "{len2}"
+        );
+        // acked at its first send, filling the cap: two such acks regrow it
+        t.handle_datagram(
+            next + 10,
+            &srv.send(0, None, Server::instr(0, 2, 2, &[]))[0],
+        );
+        assert_eq!(
+            t.state_limit(),
+            MAX_STATE_BYTES / 2,
+            "one clean ack is not enough"
+        );
+    }
+
+    #[test]
+    fn halved_cap_persists_and_regrows_after_clean_acks() {
         let mut srv = Server::new();
         let mut t = transport();
-        let data = noise(5, 200_000);
-        t.send_keys(0, &data);
-        assert_eq!(t.state_limit(), MAX_STATE_BYTES);
+        t.send_keys(0, &noise(5, 2_000_000));
+        t.state_limit = MAX_STATE_BYTES;
         let mut now = 8;
-        let open_all = |srv: &Server, out: &[Vec<u8>]| {
-            let mut r = Reassembler::new();
-            let mut msg = None;
-            for d in out {
-                let o = srv.cipher.open(d).unwrap();
-                let inner = Inner::decode(&o.plaintext).unwrap();
-                msg = r.push(inner.frag).unwrap().or(msg);
+        let mut num = 0u64;
+        // state 1 never acked in time: halved to 32 KiB
+        for _ in 0..30 {
+            drain(&mut t, now);
+            if t.state_limit() < MAX_STATE_BYTES {
+                break;
             }
-            Instruction::decode(&msg.unwrap()).unwrap()
-        };
-        for _ in 0..2 {
-            let i = open_all(&srv, &drain(&mut t, now));
-            assert_eq!((i.old_num, i.new_num), (0, 1));
             now = t.next_deadline_ms().unwrap();
-            assert!(now >= 1000, "a big state waits an RTO, got {now}");
         }
-        // third send: the cap halved and the oversize state 1 was abandoned
-        let i = open_all(&srv, &drain(&mut t, now));
-        assert_eq!(t.state_limit(), MAX_STATE_BYTES / 2);
-        assert_eq!((i.old_num, i.new_num), (0, 2));
-        // state 2 acked at its first send: the cap doubles again
-        t.handle_datagram(now + 10, &srv.send(0, None, Server::instr(0, 1, 2, &[]))[0]);
-        assert_eq!(t.state_limit(), MAX_STATE_BYTES);
+        assert_eq!(t.state_limit(), 32 * 1024);
+        // ack it late (not clean); then three states acked at first send
+        num += 1;
+        t.handle_datagram(now, &srv.send(0, None, Server::instr(0, 1, num, &[]))[0]);
+        assert_eq!(t.state_limit(), 32 * 1024, "a late ack does not regrow");
+        let mut seen = Vec::new();
+        for k in 0..4u64 {
+            now = t.next_deadline_ms().unwrap();
+            let i = open_all(&srv, &drain(&mut t, now));
+            num = i.new_num;
+            t.handle_datagram(
+                now + 5,
+                &srv.send(0, None, Server::instr(0, 10 + k, num, &[]))[0],
+            );
+            seen.push(t.state_limit());
+        }
+        // the first of these was cut under 32 KiB and acked clean (1 of 2),
+        // the second regrows to 64 KiB
+        assert_eq!(seen[0], 32 * 1024);
+        assert_eq!(seen[1], MAX_STATE_BYTES);
+    }
+
+    /// Pure latency, even with a server that holds its acks, is not loss.
+    #[test]
+    fn latency_alone_never_shrinks_the_cap() {
+        let payload = noise(11, 1 << 20);
+        for (one_way, hold) in [(1, 100), (50, 100), (150, 0), (150, 100), (300, 100)] {
+            let mut cfg = LinkCfg::new(0, one_way);
+            cfg.ack_hold = hold;
+            let x = link_sim_cfg(&[(0, &payload)], cfg, 3);
+            eprintln!(
+                "latency {one_way} ms hold {hold}: shrinks {}, final cap {} KiB, {:.2}x",
+                x.shrinks,
+                x.limit / 1024,
+                x.bytes as f64 / payload.len() as f64
+            );
+            assert_eq!(x.shrinks, 0, "latency {one_way} hold {hold} suspected loss");
+        }
+    }
+
+    #[test]
+    fn lossless_four_mib_paste_never_shrinks_the_cap() {
+        let payload = noise(12, 4 << 20);
+        for (one_way, hold) in [(0, 0), (1, 100), (50, 100)] {
+            let mut cfg = LinkCfg::new(0, one_way);
+            cfg.ack_hold = hold;
+            let x = link_sim_cfg(&[(0, &payload)], cfg, 4);
+            let ratio = x.bytes as f64 / payload.len() as f64;
+            eprintln!("4 MiB lossless one-way {one_way} hold {hold}: {ratio:.2}x, final cap {} KiB, {} ms", x.limit / 1024, x.ms);
+            assert_eq!(x.shrinks, 0, "one-way {one_way} hold {hold}");
+            assert_eq!(x.limit, MAX_STATE_BYTES, "slow start reached the full cap");
+            assert!(ratio <= 1.5, "{ratio}");
+        }
+    }
+
+    #[test]
+    fn sustained_loss_shrinks_the_cap() {
+        let payload = noise(13, 1 << 20);
+        for one_way in [1, 50] {
+            let x = link_sim(&payload, 10, one_way, 5);
+            assert!(x.shrinks > 0, "one-way {one_way}: loss never suspected");
+            assert!(x.limit >= MIN_STATE_BYTES);
+        }
+    }
+
+    /// Property test: seeded random links (loss each way, jitter that
+    /// reorders, duplication, delayed acks) with a typing script; the
+    /// invariant holds on every datagram emitted and on every one delivered
+    /// (both models panic otherwise), and the stream always converges.
+    #[test]
+    fn property_random_links_keep_the_state_invariant() {
+        let mut r = 0xB2B2u64;
+        let mut next = move |m: u64| {
+            r = r
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (r >> 33) % m
+        };
+        for case in 0..40u64 {
+            let cfg = LinkCfg {
+                loss_up: next(25),
+                loss_down: next(40),
+                one_way: next(120),
+                jitter: next(80),
+                dup: next(20),
+                ack_hold: next(3) * 50,
+            };
+            let mut chunks: Vec<(u64, Vec<u8>)> = Vec::new();
+            let mut at = 0;
+            for k in 0..(1 + next(6)) {
+                let len = match next(3) {
+                    0 => 1 + next(20),
+                    1 => 1 + next(60_000),
+                    _ => 1 + next(200_000),
+                } as usize;
+                chunks.push((at, noise(case * 10 + k, len)));
+                at += next(3000);
+            }
+            let script: Vec<(u64, &[u8])> =
+                chunks.iter().map(|(t, b)| (*t, b.as_slice())).collect();
+            let x = link_sim_cfg(&script, cfg, case + 1);
+            assert!(x.datagrams > 0);
+        }
     }
 
     #[test]
     fn big_resends_wait_an_rto_but_keystrokes_keep_the_frame_slot() {
         let mut srv = Server::new();
         let mut t = transport();
-        // learn a 100 ms RTT (rto = 300 ms), 50 ms frame slot
+        // learn a 100 ms RTT (rto = 300 ms, plus 100 ms delayed ack), 50 ms frame slot
         t.send_keys(1000, b"k");
         let (_, inner, _) = srv.open_client(&drain(&mut t, 1008)[0]);
         t.handle_datagram(
@@ -1604,13 +1968,14 @@ mod tests {
         );
         assert_eq!(t.srtt_ms(), 100.0);
         // a big paste: first send after the collection delay, resend one RTO later
+        t.state_limit = MAX_STATE_BYTES;
         t.send_keys(1200, &noise(9, 30_000));
         assert!(!drain(&mut t, 1208).is_empty());
-        assert_eq!(t.next_deadline_ms(), Some(1208 + 300));
-        assert!(drain(&mut t, 1507).is_empty());
-        assert!(!drain(&mut t, 1508).is_empty());
+        assert_eq!(t.next_deadline_ms(), Some(1208 + 400));
+        assert!(drain(&mut t, 1607).is_empty());
+        assert!(!drain(&mut t, 1608).is_empty());
         // acked: the stream is idle again and a keystroke goes within one frame slot
-        t.handle_datagram(1600, &srv.send(7, None, Server::instr(0, 2, 2, &[]))[0]);
+        t.handle_datagram(1700, &srv.send(7, None, Server::instr(0, 2, 2, &[]))[0]);
         t.send_keys(2000, b"x");
         let d = t.next_deadline_ms().unwrap();
         assert!(d <= 2000 + 50, "keystroke deadline {d}");

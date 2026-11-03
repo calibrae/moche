@@ -401,6 +401,30 @@ server.** Constants are named and live in one place:
    instruction with `ack_num = u64::MAX` and stop; resend it if the server repeats the
    final instruction (it did so under loss).
 
+**Sender invariant: states only grow (OBSERVED, cause INFERRED).** For any two states
+the client has ever sent, `new_num_a < new_num_b` implies the content of `b` extends the
+content of `a` (the input length is non-decreasing in `new_num`), and a resend of a
+number carries the same cumulative content as its first send (the diff's base may move
+with the acked state, the content does not). Evidence (round 5, `observations-round5.md`
+B2, 6 of 6 runs at 10% loss, strace-confirmed `SIGABRT` of mosh-server 1.4.0): the
+client sent `old=133 new=134` (16 KiB), then, before the ack, `old=133 new=135` with
+only 8 KiB, and the server died 3 ms after the second frame; the same signature
+(`old=66 new=67` 16,390 B then `old=66 new=68` 8,199 B) in the other runs. Inferred, not
+from source: the server's receiver treats the user-input history as a growing sequence and
+asserts when a newer state does not extend an older one it accepted. The earlier note
+that state numbers are the client's to choose was wrong for states already sent. Rules
+that follow, implemented in `ssp.rs` and tested against a server model that panics on a
+violation: (1) never abandon, shrink or re-cut a state in flight, resend it unchanged
+(same `new_num`, same content) until acked; (2) the adaptive size cap applies to the next
+cut only; while a big state is in flight no new state is cut; (3) an empty or heartbeat
+frame still takes a fresh number and has the content of the acked state, which is an
+extension of every older one. Cost consequence: a state is resent whole and the server
+needs every fragment of one copy, so a state of N fragments needs about `1/0.9^N` copies
+at 10% loss; the cap is therefore chosen before a state goes out (slow start from 16 KiB,
+halved once per state that stays unacked for a full loss RTO and three sends, regrown
+after two clean cap-filling first-send acks). Simulated 1 MiB paste at 10% loss: about
+5.7-7.9x payload (round-4 fixed 16 KiB: 5.9x); the earlier 4.1x relied on re-cutting.
+
 Items 5-6 timings are from [1] and match both capture rounds; whether a server tolerates
 deviations from them (a client that never heartbeats, acks late, omits chaff) is
 untested (U12). The cumulative-from-acked choice in item 3 is safe for the stock server

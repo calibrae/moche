@@ -292,7 +292,7 @@ fn transmitted_datagrams_respect_max_datagram() {
             n += 1;
         }
     }
-    assert!(n > 100);
+    assert!(n > 20); // first state is 16 KiB now (slow start), about 28 fragments
     assert_eq!(moche_session_free(s), MOCHE_OK);
 }
 
