@@ -1,6 +1,6 @@
 [package]
 name = "moche-cli"
-description = "Reference CLI client for moche-core"
+description = "Daily-driver mosh-compatible client built on moche-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,8 +9,15 @@ repository.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "moche-cli"
+name = "moche"
 path = "src/main.rs"
+
+[features]
+# TODO(screen): enable once moche_core::screen::Screen lands; swaps the
+# passthrough display for the real framebuffer-backed one (see display.rs).
+screen = []
 
 [dependencies]
 moche-core.workspace = true
+rustix = { version = "1.1", features = ["termios", "event", "stdio"] }
+signal-hook = "0.3"

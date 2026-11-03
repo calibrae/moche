@@ -10,3 +10,5 @@ pub mod proto;
 pub mod screen;
 pub mod ssp;
 pub mod vt;
+
+pub use screen::{ApplyError, Framebuffer, Screen, ScreenEvent};
