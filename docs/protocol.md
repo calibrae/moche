@@ -1,19 +1,32 @@
 # moche protocol notes (the contract)
 
-Status: draft 2, 2026-11-03. Built from public descriptions plus one black-box capture of
-a stock `mosh-server` 1.4.0 (source [9]). 9 of the original 16 open questions are now
-resolved by that capture; 7 remain in section 8 (Unverified).
+Status: draft 3, 2026-11-03. Built from public descriptions plus two rounds of black-box
+capture of a stock `mosh-server` 1.4.0 (sources [9], [10]). 11 of the original 16 open
+questions are resolved; 5 of them remain open or partial and 3 new ids (U17-U19) were
+opened by round 2. 8 items remain in section 8 (Unverified).
 
 Every claim below is one of three kinds:
 
 - **SOURCED**: stated by a public document, cited as `[n]` (table below).
-- **OBSERVED**: confirmed on the capture [9], cited as `obs Un` (the item id in
-  `docs/observations.md`). Caveat for all of them: the capture is ONE session of 45
-  datagrams over loopback (client and server on one box, RTT about 1 ms, no loss, no
-  fragmentation, no roaming). "Observed" means true for that session; it is not
-  proof of behaviour under loss, high RTT, large screens or other server versions.
-- **UNVERIFIED**: section 8. Put behind one named constant or function so changing it
-  is a one-line fix.
+- **OBSERVED**: confirmed on our own captures, cited as `obs Un` (item id in
+  `docs/observations.md`, round 1) or `r2 §X` (section letter in
+  `docs/observations-round2.md`, round 2). Capture conditions, for all of them:
+  - server `mosh-server` 1.4.0 (Debian package) only, no other version;
+  - client and server on one box, UDP over loopback; round 2 adds `tc netem` on the
+    loopback interface (delay 25 ms and 100 ms each way, i.e. RTT about 50 and 200 ms;
+    delay 25 ms plus 15% loss);
+  - round 1: one session, 45 datagrams; round 2: seven captures, one session each,
+    about 1100 datagrams in total;
+  - no real network, no roaming, no other server version, no other client implementation.
+
+  "Observed" means true for those sessions. It is not proof of behaviour on a real
+  network, under other loss patterns, or on other versions.
+- **UNVERIFIED**: section 8. Put behind one named constant or function so changing it is
+  a one-line fix.
+
+A fourth label is used for design: **moche choice** marks behaviour moche picks for its
+own sender or receiver. It is derived from the observations but is not a claim about the
+server.
 
 ## Sources
 
@@ -27,17 +40,18 @@ Every claim below is one of three kinds:
 | [6] | `dart_mosh` 0.0.4, API reference pages only (no source read). https://pub.dev/packages/dart_mosh , https://pub.dev/documentation/dart_mosh/0.0.4/dart_mosh/ | Apache-2.0 (per pub.dev). Independent-implementation status is not stated by the page; we use it only for names and sizes that it documents, and treat each as "documented by [6]" |
 | [7] | RFC 6298, Computing TCP's Retransmission Timer (cited by [1] as the RTT algorithm) | IETF |
 | [8] | ECMA-48 / ISO 6429 (cited by [1] as the terminal language) | standard |
-| [9] | Our own capture: stock `mosh-server` 1.4.0 from the Debian package, treated as a black box, run in a container on loopback; 45 UDP datagrams, one session, 2026-11-02. Findings in `docs/observations.md`. Lab tooling (container, capture, session script) lives in `tools/mosh-lab`; the decoder is `crates/moche-core/examples/decrypt_pcap.rs` | our own work |
+| [9] | Our own capture, round 1: stock `mosh-server` 1.4.0 from the Debian package, treated as a black box, run in a container on loopback; 45 UDP datagrams, one session, 2026-11-02. Findings in `docs/observations.md`. Lab tooling (container, capture, session script) lives in `tools/mosh-lab`; the decoder is `crates/moche-core/examples/decrypt_pcap.rs` | our own work |
+| [10] | Our own captures, round 2: same server build and container, seven captures (fragmentation, three RTT settings, 15% loss, miscellaneous sequences, client killed), 2026-11-03. Findings in `docs/observations-round2.md`. Driver `tools/mosh-lab/capture.sh`; decoder for most captures `tools/mosh-lab/analyze_pcap.py`, cross-checked by `decrypt_pcap.rs` on two of them (53/53 and 16/16 tags verify) | our own work |
 
 Not consulted, by rule: any file of mosh's repository (src, .proto), any mirror or
-fork of it, any other GPL implementation. The man pages were not fetched. The capture
-was decoded with our own code and generic `protoc --decode_raw`.
+fork of it, any other GPL implementation. The man pages were not fetched. The captures
+were decoded with our own code and generic `protoc --decode_raw`.
 
 ## 1. Scope, clean-room statement, bootstrap
 
 - moche is a client only. Hosts run the stock `mosh-server`. moche never runs a server.
 - Clean room: the wire format is reconstructed from [1]-[6] and from observation of a
-  real server [9]. Nothing is copied, translated or paraphrased from mosh's source.
+  real server [9, 10]. Nothing is copied, translated or paraphrased from mosh's source.
   Every byte layout below is sourced, observed, or in section 8.
 - Bootstrap (done by the host app, outside the core). The user logs in with ordinary
   means (SSH), an unprivileged server is started, it listens on a high UDP port and
@@ -70,7 +84,9 @@ SOURCED:
 | The sequence number has a direction bit "masked out" of it | [6] |
 | No replay cache or message history is needed: each datagram is an idempotent diff between numbered states | [1 s2.2] |
 
-OBSERVED (obs U2, U3, U4; 45/45 datagrams verify, both directions):
+OBSERVED (obs U2, U3, U4; 45/45 datagrams verify, both directions; round 2 re-verified
+on 53/53 and 16/16 datagrams of two further captures with the Rust decoder, and on all
+seven with the Python decoder, r2 Method):
 
     wire datagram = nonce8 (cleartext) || OCB3 ciphertext || tag16
     nonce12       = 00 00 00 00 || nonce8         (the 8 wire bytes unchanged)
@@ -79,7 +95,8 @@ OBSERVED (obs U2, U3, U4; 45/45 datagrams verify, both directions):
 - Direction bit: the top bit (0x80 of byte 0) of the 8-byte big-endian wire nonce.
   Clear for client to server, set for server to client. The remaining 63 bits are the
   sequence number: +1 per datagram per direction, starting at 0 (obs U2: client 0..24,
-  server 0..19).
+  server 0..19). Under netem loss the counters show holes where datagrams were dropped
+  but never repeat or go backwards (r2 §C).
 - The direction bit is KEPT in the 12-byte AEAD nonce. Clearing it before building the
   nonce verifies only the client packets (25/45). So "masked out" [6] describes how the
   sequence number is read, not what goes into the nonce.
@@ -100,18 +117,25 @@ the server was not tested (section 8, U12).
 
 ## 3. Network (datagram) layer
 
-Decrypted plaintext layout (OBSERVED, obs summary, U5, U6, U16; 45/45):
+Decrypted plaintext layout (OBSERVED, obs summary, U5, U6, U16; round 1 45/45; round 2
+confirmed on all captures including multi-fragment messages, r2 §A):
 
     ts        u16 big-endian   sender's millisecond clock, mod 65536
     ts_reply  u16 big-endian   0xffff = "no reply"
     frag_id   u64 big-endian   \  10-byte fragment header
     flags     u16 big-endian   /  bit 15 = final fragment, bits 0-14 = fragment number
-    payload   zlib stream (RFC 1950, starts 78 9c) of one protobuf transport instruction
+    payload   a slice of one zlib stream (RFC 1950, whole stream starts 78 9c) of one
+              protobuf transport instruction
 
 The timestamps are outside the instruction (matches [1 s2.2]). The fragment header sits
-inside the encrypted plaintext, not in clear. Order of operations on send:
-compress, then add the fragment header, then encrypt (obs U6; the fragment-then-encrypt
-part is only inferred, see U6 in section 8).
+inside the encrypted plaintext, not in clear.
+
+Order of operations on send (OBSERVED, r2 §A, 5 fragmented messages): serialise the
+instruction, compress it ONCE into a single zlib stream, cut the compressed blob into
+pieces, give each piece a fragment header, encrypt each datagram on its own. Evidence:
+the concatenated payloads of fragments 0..n inflate as one valid zlib stream (adler32
+ok) for all five messages; only fragment 0 starts with `78 9c`; fragments 1..n do not
+inflate alone. This resolves U6.
 
 Timestamps (SOURCED [1 s2.2]: every datagram carries a millisecond timestamp and an
 optional "timestamp reply", the peer's latest timestamp, adjusted by the time held):
@@ -123,22 +147,28 @@ optional "timestamp reply", the peer's latest timestamp, adjusted by the time he
 - OBSERVED: `ts_reply` = the peer's latest `ts` plus the time it was held locally
   (e.g. server ts 2377, client reply 2481 after a 104 ms hold; hold 0 gives the same
   value back). Each received timestamp is echoed once; with none pending the field is
-  `0xffff`, which happened in roughly half the packets.
+  `0xffff`, which happened in roughly half the packets (both rounds).
+- OBSERVED (r2 Other, one occurrence): a client `ts` wrapped 65384 to 732 during normal
+  operation with no effect on the `ts_reply` handling.
 - moche rule (derived): send `ts = now_ms mod 65536`; send `ts_reply = peer_ts + held_ms`
   (mod 65536) once per received timestamp, otherwise `0xffff`; on receipt,
   `rtt = (now16 - ts_reply) mod 65536` when `ts_reply != 0xffff`.
-- Single-capture gaps: no timestamp wrap was captured, and what a peer does with a
-  genuine value of 65535 is unknown.
+- Remaining gap: what a peer does with a genuine value of 65535 is unknown (U16 residual).
+- Netem caveat for timing data (r2 Method): the capture tap sits after the netem qdisc,
+  so netem'd captures have timestamps of send time plus one-way delay in BOTH directions.
+  Gaps between consecutive packets of the same sender are unaffected; gaps measured
+  across directions (for example a delayed ack) include the added one-way delay.
 
 RTT (SOURCED [1 s2.2]): TCP's algorithm [7] with three changes:
 1. each datagram has a unique sequence number, so retransmissions are unambiguous;
 2. the timestamp reply is adjusted by the time elapsed since the corresponding
    timestamp was received, so delayed acks do not bias the estimate;
 3. the minimum retransmission timeout is 50 ms (not 1 s).
-moche keeps SRTT and RTTVAR per [7] (alpha 1/8, beta 1/4, RTO = SRTT + 4*RTTVAR,
-clamped below at 50 ms). The constants are RFC 6298's; the upper clamp is U9. See the
-contradiction note under section 4 (Retransmit): the capture saw resends sooner than
-50 ms apart.
+moche keeps SRTT and RTTVAR per [7] (alpha 1/8, beta 1/4). Round 2 shows 1.4.0 pacing
+resends by frame slot, not by an RTO (section 4, Retransmit), so moche v1 needs SRTT only
+(for the frame interval). The RTO (SRTT + 4*RTTVAR, clamped below at 50 ms per [1]) is
+computed but not used to pace sends; its upper clamp and any other use are U9. See the
+contradiction note in section 4.
 
 Roaming (SOURCED [1 s2.2]): when the server receives an authentic datagram with a
 sequence number greater than any before, it adopts that packet's source IP and UDP port
@@ -147,7 +177,7 @@ the host app has; no signalling is needed. Heartbeats (section 4) let the server
 the new address even when the client has nothing to say [1 s2.3]. Host-app note: after a
 network change, send promptly (a heartbeat or any frame) so the server re-targets. The
 client must not send with a repeated or lower sequence number than before (follows from
-the rule). Roaming was NOT exercised in the capture [9].
+the rule). Roaming was NOT exercised in either capture round (U17).
 
 Fragmentation:
 
@@ -155,24 +185,49 @@ Fragmentation:
   at most an MTU's worth of content; fragments carry a group id, a zero-based fragment
   number and a final-fragment flag; the header is 10 bytes before the content. Both a
   default send MTU and a receive MTU exist. Compression is zlib.
-- OBSERVED, single-fragment only (obs U5): the 10-byte header layout above, with
-  `flags = 0x8000` (final, number 0) on all 45 datagrams. The bit split of `flags` is
-  inferred from that and from [6]; a non-final fragment was never seen. Still open: U5, U6.
-- `frag_id` (obs U5): equals the wire sequence number + 1 on every datagram in both
-  directions. The three resends of one instruction (obs, pkts #26-28) got new wire
-  numbers AND new ids, so the id is not stable per instruction across resends. moche
-  rule: use a counter that increases by one for each datagram built (this satisfies both
-  readings consistent with the capture, and is safe on resend).
-- Largest datagram seen: 443 bytes on the wire (an instruction inflating to 919 bytes).
-  Nothing came near an MTU, so MTU and chunk size are open (U6).
+- OBSERVED (r2 §A; capture `frag`, terminal 250x80, loopback, 5 multi-fragment messages
+  of 2, 3, 4, 6 and 9 fragments, all server to client): the 10-byte header layout above
+  is confirmed. 19 datagrams had fragment number != 0 and final bit clear, exactly the
+  non-last fragments; numbers run 0, 1, 2, ...; the final bit is set only on the last
+  fragment of a message. Resolves the bit split of `flags` (U5).
+- OBSERVED (r2 §A): a full fragment carries 1214 payload bytes. The datagram is then
+  1252 bytes = 8 nonce + 4 timestamps + 10 fragment header + 1214 payload + 16 tag.
+  1252 bytes is the maximum datagram length seen (server to client); the largest client
+  datagram seen is 92. The last fragments of the five messages carried 162, 470, 454,
+  454 and 554 bytes. Compressed message sizes were 2590, 4112, 6524, 10166 and 1768
+  bytes (inflated 6156 to 40377).
+- INFERENCE, not a measurement: 1252 + 28 (IPv4 + UDP headers) = 1280, which looks like
+  the IPv6 minimum MTU. It could equally be a coincidence of constants. Nothing in the
+  captures confirms that 1.4.0 derives its chunk size from an MTU, or that it ever
+  adapts it. moche treats 1214 as an observed value, not as a protocol constant: the
+  receiver must accept any chunk size, and the sender's chunk size is one named constant.
+- `frag_id` (OBSERVED, r2 §A): ONE id per sent instruction, shared by all of its
+  fragments, increasing by 1 per instruction (ids 10..14 for five consecutive messages
+  while the wire counters ran 9..32). A resend of an unacked instruction gets a fresh id
+  (and fresh wire counters) on every copy (round 1 resends #26-28; r2 §A, §B). Round 1's
+  observation "id = wire counter + 1" was a coincidence of one datagram per instruction
+  (see the flagged corrections list at the end of section 8). moche rule: keep a counter
+  that increases by one for each INSTRUCTION sent, resends included; all fragments of
+  that send carry the same value.
+- Fragments of one message are sent back to back, with identical `ts` (same
+  millisecond) and consecutive wire counters, no pacing between them (r2 §A, #22-#25).
+- `seq 1 20000` and similar bulk output never fragmented: the server sends screen
+  diffs, not an output stream, and datagrams stayed under 300 bytes (r2 §A). Fragmentation
+  happens on large screen changes (full-screen colour fills at 250x80, a full repaint
+  after a resize on a big window).
+- Client messages are small (max 92 bytes in all captures). moche still needs a
+  fragmenter on the send side for large pastes (a pasted block is one keystroke diff);
+  it uses the same split as above (compress once, cut, header per piece, encrypt each).
 
-Reassembly (moche behaviour, derived from the fields above): collect fragments by group
-id; complete when the final fragment has arrived and fragment numbers 0..=final are all
-present; concatenate, zlib-inflate, parse the instruction. Drop incomplete groups when a
-newer group id completes or when a bounded buffer is exceeded (the limit is a moche
-choice; [6] mentions a fragment assembly limit exists). Whether each fragment is
-compressed on its own or the whole instruction is compressed once and then cut is
-untested (U6); the rule above assumes the latter.
+Reassembly (moche choice, derived from the fields above; the receiver side is NOT
+exercised by any capture, U18): collect fragments by group id; complete when the final
+fragment has arrived and fragment numbers 0..=final are all present; concatenate in
+fragment-number order, zlib-inflate the whole, parse the instruction. Do not inflate a
+fragment alone. Drop incomplete groups when a newer group id completes or when a bounded
+buffer is exceeded (the limit is a moche choice; [6] mentions a fragment assembly limit
+exists). A duplicate fragment (same id and number) is ignored. Because ids are per
+instruction and fresh on resend, a resent instruction arrives as a new group; do not
+try to merge fragments across ids.
 
 ## 4. SSP: transport layer
 
@@ -182,7 +237,7 @@ the user's input; server to client, the contents of the terminal window [1 s2].
 Instruction: a self-contained message listing the source and target states and the
 binary diff between them [1 s2.3]. Protobuf, same message both directions. Field names
 from [6]; field numbers and wire types OBSERVED (obs U7, confirmed with
-`protoc --decode_raw`; 45/45):
+`protoc --decode_raw`; 45/45, and all captures decode in round 2):
 
 | Field no. | Wire type | Name | Meaning | Source of name |
 |-----|-----------|------|---------|--------|
@@ -192,7 +247,7 @@ from [6]; field numbers and wire types OBSERVED (obs U7, confirmed with
 | 4 | varint | ack_num | latest state of the peer's stream the sender has received | [6] |
 | 5 | varint | throwaway_num | state number below which the receiver may discard states (see Throwaway) | [6] |
 | 6 | bytes | diff | opaque payload, a user-message or host-message encoding (section 5); present with length 0 on empty frames (`32 00`) | [1, 6] |
-| 7 | bytes | chaff | random padding, length 0 to 16 bytes, seen in both directions, on empty frames too | [6] |
+| 7 | bytes | chaff | random padding, length 0 to 16 bytes, seen in both directions, on empty frames and on fragmented messages too (r2 Other) | [6] |
 
 Receiver rule: skip unknown fields, do not reject (section 5).
 
@@ -200,71 +255,157 @@ Semantics:
 
 - A diff is idempotent: applying it to state `old_num` yields `new_num`. SSP can diff
   any two states, so the sender need not send every intermediate one [1 s2.2-2.3].
-- Numbering (OBSERVED, obs U12/13/9 table): every frame takes a fresh `new_num`, even
-  an empty-diff frame (empty frame old=3 new=4, next data frame old=3 new=5, i.e. the
-  base stays the last ACKED state and `new_num` keeps rising). Server instructions diff
-  from the last state the client acked (obs U14).
-- Shutdown (SOURCED [6]: a reserved state number signals shutdown; OBSERVED, obs U10):
-  `new_num = 2^64 - 1` (`0xffffffffffffffff`, a 10-byte varint, so `new_num` is a full
-  64-bit field). Seen once, server to client, right after the shell exited; its diff
-  carried the final screen repaint. The client acked it with `ack_num = 2^64 - 1`.
-  moche must therefore treat `new_num == u64::MAX` as "peer closing", send that ack,
-  and not try to store it as a normal state. Client-initiated shutdown and what a client
-  should do when the server then goes silent were not observed.
+- Numbering (OBSERVED, obs U12/13/9 table; r2 §C): every frame that is a new send takes
+  a fresh `new_num`, even an empty-diff frame (empty frame old=3 new=4, next data frame
+  old=3 new=5). Under loss, `new_num` may SKIP values the receiver never sees: r2 §C
+  saw S>C new=15 followed by old=14 new=17 with the datagram carrying new=16 lost. A
+  receiver must therefore never assume `new_num == previous new_num + 1`.
+- Choice of `old_num`: see "Receiver rule for old_num" below. This is the part the
+  server's rule is not fully known for (U13).
+- Shutdown (SOURCED [6]: a reserved state number signals shutdown; OBSERVED, obs U10;
+  r2 Other, §C): `new_num = 2^64 - 1` (`0xffffffffffffffff`, a 10-byte varint, so
+  `new_num` is a full 64-bit field). Seen in every capture that ended with `exit`,
+  server to client, right after the shell exited; its diff carried the final screen
+  repaint. The client acks it with `ack_num = 2^64 - 1`. Under 15% loss the server sent
+  the final instruction twice, 32 ms apart, until the client's ack arrived (r2 §C), and
+  the client resent its own last keystrokes too. moche must therefore treat
+  `new_num == u64::MAX` as "peer closing", send that ack, and not store it as a normal
+  state. Client-initiated shutdown was not observed.
 - Protocol version (OBSERVED, obs U8): 2 in every instruction, both directions. moche
   sends 2. Server reaction to another value is untested (U12).
-- Acks: the transport sender uses delayed acks, like TCP; a delay of 100 ms was enough
-  to piggyback on host data in over 99.9% of cases [1 s2.3]. An ack travels in the
-  `ack_num` of whatever instruction goes out next. OBSERVED (single session, loopback):
-  the client sent a bare ack about 100 ms after the first unacked server frame, three
-  times (obs U12 table).
-- Throwaway (OBSERVED, obs U11 partial): `throwaway_num` = the highest number of the
-  sender's OWN stream that the peer has acked (server `thr=5` after the client acked 5;
-  client `thr=14` after the server acked 14). `old_num >= throwaway_num` in 45/45, with
-  equality common. So the receiver must keep state `throwaway_num` itself (it is the
-  base of in-flight diffs) and may drop states strictly below it. Inferred from no-loss
-  data only: U11.
+
+Timing (OBSERVED, r2 §B, §C, §D; loopback with netem delay on `lo`, 1.4.0; see the
+netem caveat in section 3). "RTT" below is the added round trip (0, 50, 200 ms) on top
+of about 1 ms of loopback.
+
+| Quantity | rtt0 | rtt50 | rtt200 | Note |
+|---|---|---|---|---|
+| Frame interval (spacing of resends and back-to-back sends) | about 20 ms | about 32 ms (median, 26-41) | about 105 ms (median, 101-112) | about RTT/2 plus 5-8 ms, floor about 20 ms at low RTT; round 1 (RTT about 1 ms): 21-28 ms |
+| Idle heartbeat gap, both directions | 3004-3010 ms | 2996-3017 ms | 3003-3015 ms | about 3.0 s regardless of RTT |
+| Server data frame to next client datagram (median / p90) | 89 / 108 ms | 87 / 135 ms | 102 / 106 ms | delayed ack about 100 ms, earlier if the client has keystrokes to send; rtt50/rtt200 include the netem delay |
+| Keystroke to first client datagram carrying it (median) | 10 ms (5-46) | 40 ms (33-76) | 147 ms (27-220) | includes netem delay; a key waits for the next frame slot |
+
 - Frame interval (SOURCED [1 s2.3, footnote 1]): minimum interval between frames is
   half the smoothed RTT, so about one instruction is in flight; capped at 50 Hz (at
-  least 20 ms). A bound at high RTT is not given (U9).
+  least 20 ms). The observed 20 ms floor at low RTT and about RTT/2 at high RTT fit
+  this, with a consistent extra 5-8 ms that the paper does not mention. The ceiling at
+  very high RTT is not bounded by anything observed beyond 105 ms (U9). Five large
+  messages at rtt0 were sent 20 ms apart (r2 §A).
 - Collection interval (SOURCED [1 s2.3, s4]): after the application's first write, the
   server waits 8 ms to collect more output, and always waits at least the frame
   interval after the previous frame. OBSERVED loosely: the server answered a keystroke
-  in about 8-9 ms (obs U12 table). Moche's analogue for user input is U12.
+  in about 8-9 ms (obs U12 table). Not separately resolved from the frame interval.
+- Delayed ack (SOURCED [1 s2.3]: a delay of 100 ms was enough to piggyback on host data
+  in over 99.9% of cases; an ack travels in the `ack_num` of whatever instruction goes
+  out next). OBSERVED (obs U12 table; r2 §B): the client sent a bare ack about 100 ms
+  after the first unacked server frame (loopback: 104, 103, 110 ms) and the median
+  data-frame-to-next-datagram times above sit at 87-102 ms at every RTT. The constant
+  is not resolved beyond "about 100 ms".
 - Heartbeat (SOURCED: SSP sends an occasional heartbeat so the server learns of
   roaming, the client can warn the user when silent, and NAT mappings stay open; the
-  interval is 3 seconds [1 s2.3; [2] "at least every three seconds"]). OBSERVED: server
-  empty frames arrived about 2.9-2.95 s after the last traffic (obs U12 table).
+  interval is 3 seconds [1 s2.3; [2] "at least every three seconds"]). OBSERVED (r2
+  §B): about 3.0 s between empty frames in both directions at every RTT; round 1's
+  2.9-2.95 s was measured from the last traffic, not from the last empty frame. The
+  client's empty frames are mostly its delayed acks of the server's heartbeats.
+- Throwaway (OBSERVED, obs U11 and r2 §C): `throwaway_num` = the highest number of the
+  sender's OWN stream that the peer has acked (server `thr=5` after the client acked 5;
+  client `thr=14` after the server acked 14). `old_num >= throwaway_num` in 45/45 of
+  round 1; in round 2, `thr == old` on every line of the first and last ~50 packets of
+  the loss capture, and in the burst case below `old > thr` (never `old < thr`); not
+  exhaustively checked on all packets (r2 §C, Medium). So the receiver must keep state
+  `throwaway_num` itself (it is the base of in-flight diffs) and may drop states
+  strictly below it.
 - Echo ack (SOURCED [1 s3.2]): the server-side terminal object carries an "echo ack"
   for the latest keystroke presented to the app for at least 50 ms. OBSERVED (obs
   U14): it is the client's `new_num` of the keystroke state being echoed, and arrives
   in the host message (section 5), often in a separate small frame 55-70 ms after the
-  data frame.
-- Retransmit: the paper gives the RTO floor and the idempotent-diff design, which
-  implies "resend the diff from the last state the peer acked" rather than resend a
-  specific packet. OBSERVED (obs U12/13, one case): the client sent the same
-  (old=12, new=14) instruction three times, with new wire sequence numbers, new
-  `frag_id`s and different chaff length each time. The exact trigger and base: U13.
+  data frame. Round 2 saw the echo-ack-only frame at every RTT (r2 §B, Medium).
+- Retransmit (OBSERVED, r2 §B, §C; obs U12/13): an unacked instruction is simply sent
+  again at each frame slot until the peer acks it, up to 3 copies per key at RTT 50. A
+  resend of an unchanged state repeats the same (old_num, new_num) and the same diff,
+  with a fresh wire counter, a fresh `frag_id` and a freshly chosen chaff length.
+  There is no exponential backoff in any run: resend gaps stay at the frame interval
+  (loss capture, delay 25 ms, 15% loss: client median 30 ms, server median 36 ms, p90
+  51 and 42 ms), with rare larger gaps up to about 180 ms (one 5-resend run: 181, 36,
+  30, 36, 33 ms) which are probably lost sends or a stretched send interval, not a
+  separate timer. No separate RTO is visible.
 
 **Contradiction flagged (not overwritten): RTO floor.** [1] gives a 50 ms minimum
-retransmission timeout, but the three resends above were 21 and 28 ms apart (loopback,
-RTT about 1 ms). Possible explanations, none tested: 1.4.0's floor or its frame pacing
-is lower than the paper's (the paper's own 20 ms frame-interval cap would fit 21-28
-ms), or resends are paced by the frame interval rather than by the RTO. moche keeps 50
-ms as its own floor (the conservative choice) and U9 asks for a `tc netem` run.
+retransmission timeout. Round 1 saw resends 21 and 28 ms apart (RTT about 1 ms). Round 2
+does not remove the contradiction: at RTT 50 the median resend gap is 32 ms (26-41),
+again below 50 ms, and it tracks RTT/2 plus a few ms at RTT 200 (105 ms). So 1.4.0 as
+observed paces resends by the frame interval, and no 50 ms floor shows up on resend
+spacing. The paper's RTO statement may describe a timer that fires only in cases we did
+not hit, or an older version; untested. moche does not depend on the floor (it resends
+per frame slot, see the moche sender below) and keeps 50 ms as its own clamp where an
+RTO is needed at all (U9).
 
-moche sender (v1), as the minimum that keeps a stock server happy:
-1. Keep `sent_states`: the pending user-input states, numbered, with the last one the
-   peer acked as `old_num`. Every frame, including an empty one, takes a new `new_num`.
-2. When input exists and the frame interval has elapsed: send diff(old=acked, new=latest)
-   with the current `ack_num`, `throwaway_num` and a random chaff length 0-16.
-3. If nothing was sent for the heartbeat interval: send an empty-diff instruction
-   (with a new `new_num`).
-4. If an ack is owed and 100 ms passed with nothing to piggyback on: send an empty
-   instruction carrying the ack.
-5. If an instruction is unacked after RTO: resend (diff from the last acked state).
-Steps 3-5 timings are from [1] and match the single capture; whether a server tolerates
-deviations is untested (U12).
+Receiver rule for `old_num` (OBSERVED rule of the server's output; moche choice for
+the receiver; the server-side cause is open as U13):
+
+- In capture `frag` (r2 §A), during a burst of five large messages the server diffed
+  each new state from the PREVIOUS STATE IT HAD JUST SENT (old 9, 10, 11, 12, 13 for
+  new 10..14), while `thr` stayed at 8 and the client's latest ack in that direction
+  was 8. In capture `rtt50` (r2 §A, #16-#18) and in the loss capture (r2 §C #9-#15), the
+  server kept `old` at the last ACKED state for several successive new numbers
+  (old=5 for new 7, 8, 9 at 30-40 ms apart; old=2 for new 4, 5, 5, then old jumps to 4
+  after the client's ack). Round 1 (obs U14) saw only the second pattern.
+- Counts (r2 §C): `old != previous new` is normal operation, not a loss marker (loss
+  C>S 41 and S>C 73 occurrences; no-loss rtt50 C>S 30 and S>C 101).
+- Therefore the receiver MUST NOT assume `old_num == last acked state`, nor
+  `old_num == previous new_num`. Rule: when an authentic instruction arrives, look up
+  `old_num` in the stored states. If the state is held, apply the diff to it and store the
+  result as `new_num` (when `new_num` is not already held). Drop the instruction only
+  when the base state is gone (never held, or discarded by throwaway). This is
+  correct for both patterns because diffs are idempotent against a named state.
+- Corollary for the receiver's retention: keep every state `>= throwaway_num`, because an
+  in-flight diff may be based on any of them (U11).
+- Corollary for acks: `ack_num` sent = the highest `new_num` applied (or held) so far;
+  an instruction whose `new_num` is already held is a duplicate, ignore its diff but
+  still send an ack (the earlier ack may have been lost).
+
+**Open question (U13): the server's rule for choosing `old_num`.** Two patterns are
+observed (previous in-flight state vs last acked state) and the trigger is unknown. Not
+tested: message size or fragmentation (the in-flight pattern happened on 3-9-fragment
+messages), send spacing relative to SRTT (20 ms apart at RTT about 0 vs 30-40 ms at RTT
+50), or a per-state decision. The receiver rule above makes moche independent of the
+answer. The answer matters for the client's own sender, where the choice is moche's
+(next list).
+
+moche sender (v1), **moche choice derived from observation, not a claim about the
+server.** Constants are named and live in one place:
+
+1. Keep `sent_states`: the pending user-input states, numbered, with the last state the
+   server acked as the base. Remove states below the acked one when the server's
+   `ack_num` advances. Every NEW send takes a fresh `new_num` (empty frames included).
+2. Frame interval (r2 §B): `FRAME_INTERVAL = max(20 ms, SRTT/2 + 6 ms)`, with a
+   placeholder upper cap of 250 ms (U9; observed only up to 105 ms) and 20 ms before the
+   first RTT sample. Never send two frames closer than this.
+3. Input: user bytes and resizes accumulate. At the next frame slot send one instruction
+   (old = last acked state, new = a fresh number) whose diff is the CUMULATIVE
+   concatenation of every input event after the acked state, in order, with the current
+   `ack_num` and `throwaway_num`, and a random chaff length 0-16 (U12: whether chaff
+   is required is untested).
+4. Resend (r2 §B, §C): while the last instruction is unacked, at each frame slot send it
+   again. If nothing new was typed, repeat the same (old, new) and diff; if new input
+   arrived, use a fresh `new_num` and the cumulative diff from the acked state (this is
+   what the server was seen doing under loss). Every copy gets a fresh wire counter and
+   a fresh `frag_id` (per instruction sent, section 3). No exponential backoff.
+5. Delayed ack (r2 §B): if an ack is owed (an authentic server instruction advanced the
+   state we hold) and 100 ms passed with nothing to piggyback it on, send an empty
+   instruction (fresh `new_num`, empty diff) carrying `ack_num`. Anything sent sooner
+   carries the ack.
+6. Heartbeat (r2 §B): if nothing was sent for 3.0 s, send an empty instruction with a fresh
+   `new_num`. This also lets the server learn a new address after roaming.
+7. Shutdown: on a server instruction with `new_num == u64::MAX`, send an empty
+   instruction with `ack_num = u64::MAX` and stop; resend it if the server repeats the
+   final instruction (it did so under loss).
+
+Items 5-6 timings are from [1] and match both capture rounds; whether a server tolerates
+deviations from them (a client that never heartbeats, acks late, omits chaff) is
+untested (U12). The cumulative-from-acked choice in item 3 is safe for the stock server
+because every stored base on the server side is a numbered state it still holds; it is
+the same pattern the server itself used under loss.
 
 ## 5. Payload messages (protobuf)
 
@@ -294,7 +435,8 @@ Client to server, "user message" [6]: keystrokes and resize, in order. The paper
 states that for user input the diff contains every intervening keystroke [1 s2.3]; so a
 user-message diff for old=A, new=B is the concatenation of every keystroke and resize
 event between A and B, in order. OBSERVED: the first client frame carried a resize
-(100x30) and a later one an 80x24 resize.
+(100x30) and a later one an 80x24 resize. Non-ASCII input travels as raw UTF-8 bytes
+in the keystroke element, with no escaping (r2 §D, misc #6-#11).
 
 Server to client, "host message" [6]:
 
@@ -324,120 +466,196 @@ Sourced facts:
   (xterm, gnome-terminal, Terminal.app, PuTTY): cursor motion, bold and colour
   rendering, erase [1 s3.1; 8]. Mosh itself has no scrollback [1 s2].
 
-Observed (obs U14, U15; single session):
+Observed, round 1 (obs U14, U15):
 
 - State 0 is a blank screen. The first screen arrives as old=0, new=1.
-- The server diffs from the last state the client acked, so `old_num` is usually an
-  earlier state than the previous `new_num`.
 - A client resize makes the server answer with a resize element then a full clear
   (`ESC[r ESC[0m ESC[H ESC[2J`) and a complete repaint (902 VT bytes for 80x24). The
   framebuffer must be resized on the resize element, then repainted from the bytes.
-- Full-screen applications are NOT passed through. `vim` was drawn on the PRIMARY
-  screen with scroll-region repaints (e.g. `ESC[1;29r`), with no `?1049` (alternate
-  screen) anywhere in the 45 inflated instructions. This contradicts the earlier
-  expectation that alternate screen would appear; moche needs the sequences seen in
-  the data, not the ones a normal terminal would see. Alternate-screen support stays
-  a "maybe", to be driven by recordings (U15).
 - Mode toggles in a repaint were seen: `?25l/h`, `?2004h/l`, `?1015l`, `?1006l`,
   `?1005l`, `?1004l`.
+
+Observed, round 2 (r2 §A, §D; the capture conditions stated at the top apply):
+
+- Full-screen applications are NOT passed through. No `?1049` (alternate screen) appears
+  in ANY capture of either round (0 hits in `frag` and `misc` as well as round 1). The
+  server paints alt-screen content on the PRIMARY screen with cursor addressing and
+  erase sequences: `htop` used `ESC[2;120H`, `ESC[113X` (erase characters), `ESC[K`;
+  a test of the alternate screen produced `ESC[?25l ESC[2;1H ESC[K ... ESC[9X ESC[5;10H`
+  plus the text (r2 §D, misc #41, `frag` #51-#56). The server's emulator is the filter:
+  the client never sees the application's own mode switches for the alternate screen.
+  This confirms and widens the round 1 finding; it is not a contradiction of it.
+- SGR (r2 §D): every SGR run starts with `0;` (a full reset, then the set), e.g.
+  `ESC[0;1;32m`. 256-colour foreground is `ESC[0;38;5;Nm`, foreground plus background
+  `ESC[0;38;5;F;48;5;Bm` (counts in `frag`: 4617 `38;5;N`, 2297 `48;5;N`). Low colours
+  appear to be rewritten to classic codes when they fit (N < 8 became `3x`, seen
+  `ESC[0;31;48;5;126m`; Medium). Truecolor passes through: `ESC[0;38;2;10;200;30m`.
+  Attributes: input `ESC[1;4;7;9m` came out as `ESC[0;1;4;7m`: bold, underline and
+  reverse are kept, STRIKETHROUGH (9) is DROPPED, italic `ESC[3m` becomes `ESC[0;3m`.
+  Consequence: the interpreter needs no strikethrough cell attribute; 256-colour and
+  truecolor foreground and background must be modelled.
+- Wide and combining characters (r2 §D): wide characters (CJK, emoji, fullwidth Latin)
+  travel as raw UTF-8 in host bytes, with no escape-encoded width and no width hints on
+  the wire. Combining marks are emitted as the base character followed by its combining
+  bytes, not precomposed (`e` + U+0301, `a` + U+0308 + U+0302, Devanagari base + mark).
+  The receiver must compute cell widths itself and attach combining marks to the
+  previous cell. Which Unicode width table the server uses is not observable; a
+  mismatch would shift columns (U15).
+- Mode toggles and one-shot events (r2 §D): each of the following arrived in its own
+  small frame, as raw sequences in the host bytes: `ESC[?1000h` and `ESC[?1006h` (mouse
+  enable); a mouse reset, one frame with `ESC[?1003l ESC[?1002l ESC[?1001l ESC[?1000l
+  ESC[?1015l ESC[?1006l` (all mouse modes, 1003 first); `ESC[?2004h` and `ESC[?2004l`
+  (bracketed paste); `ESC[?25l` and `ESC[?25h` (cursor visibility); BEL (`0x07`, a
+  single byte in its own frame).
+- Title (r2 §D, Medium): an application OSC 0 (`ESC]0;...BEL`) is forwarded as `ESC]0;...BEL`. After
+  the application then sent OSC 2, the next frame carried `ESC]1;<old>BEL ESC]2;<new>BEL`
+  (icon name and title as separate sequences, re-sent).
+- `seq 1 20000` never fragmented: the server sends screen diffs, not application output.
 
 moche model (design, to be validated against recordings, section 7):
 
 - Keep `states: BTreeMap<u64, Framebuffer>`, starting with state 0 = blank screen of
   the initial size.
-- On an authentic instruction with `new_num > latest`: look up `old_num`. If missing,
-  drop the instruction (the server will retry against an acked base). Else clone it,
-  apply `diff` through the VT interpreter, store as `new_num`, update `ack_num` to
-  send, and mark the screen dirty. `new_num == u64::MAX` is shutdown, see section 4.
+- On an authentic instruction: apply the receiver rule for `old_num` in section 4
+  (apply whenever the base state is held; drop only when it is gone). A diff with
+  `new_num` not greater than the latest held is allowed (idempotent re-application to
+  another base can only produce the same state); store it only if not already held.
+  `new_num == u64::MAX` is shutdown, see section 4. Update the `ack_num` to send and
+  mark the screen dirty.
 - Discard: when an instruction arrives with `throwaway_num = t`, drop all stored
   states with number < t, always keeping the latest. Strictly-below is observed-consistent
-  but loss-untested (U11).
+  on loss data too (r2 §C, Medium), but the sender's choice of `old_num` (U13) is not
+  fully known, so a state `>= t` is never dropped.
+- The framebuffer holds, besides the cell grid and cursor: current title and icon name,
+  cursor-visible, bracketed-paste, mouse-mode flags (1000-1006, 1015) and the other mode
+  toggles listed above. BEL is an EVENT, not state: the interpreter reports it to the
+  host and does not store it.
 - Screen handed to the host: full repaint (clear, draw all cells, set cursor and
-  modes) generated from the current framebuffer. Chosen for v1 because the host
+  modes, title) generated from the current framebuffer. Chosen for v1 because the host
   (SwiftTerm) only needs bytes, and it is stateless and robust against skipped
   states. A minimal diff against the last painted frame is a later optimisation.
 - Predictive local echo: out of v1; the framebuffer is kept separate from any
   overlay so it can be added.
 
-VT subset: U15. Seen so far, in this capture only: `ESC[r`, `ESC[0m`, `ESC[H`, `ESC[2J`,
-`ESC[K`, `ESC[?25l/h`, `ESC[?2004l`, `ESC[1;29r`, cursor positions `ESC[29;1H` style,
-SGR `ESC[0;1;32m` / `;36m` / `;34m`, OSC 0 title with BEL, BEL, `\r\n`. No `38;5;n`
-(256-colour), no wide characters, no combining marks. Do not assume it equals xterm;
-build the interpreter from recordings.
+VT subset (U15). Seen so far across both rounds, on loopback with 1.4.0 only: `ESC[r`,
+`ESC[0m`, `ESC[H`, `ESC[2J`, `ESC[K`, `ESC[nX` (erase characters), `ESC[?25l/h`,
+`ESC[?2004h/l`, `ESC[1;29r` scroll regions, cursor positions `ESC[29;1H` style,
+SGR forms in the bullet above (classic, 256-colour, truecolor, bold/underline/reverse/italic),
+mouse mode sets and resets, mode resets `?1015l ?1006l ?1005l ?1004l`, OSC 0/1/2
+titles with BEL, BEL, `\r\n`, raw UTF-8 with wide and combining characters. Not seen:
+`?1049` (alternate screen), strikethrough. Do not assume it equals xterm; build the
+interpreter from recordings.
 
 ## 7. Test plan
 
 All vectors are captured from a real `mosh-server` run in a container (lab tooling:
 `tools/mosh-lab`), and checked into `tests/vectors/` with no real hostnames, IPs or
-user data.
+user data. Of the round 2 captures, only `misc` and `misc_kill` are in
+`tools/mosh-lab/.state/captures/`; the other five pcaps stay on the docker host, with
+their sha256 listed in `docs/observations-round2.md`. Pull and trim them (the `frag`
+capture especially, for the fragment vectors) into `tests/vectors/` before building
+tests on them.
 
-Status after [9]: items 1, 2 (primary) and 4 (field numbers, version, chaff, shutdown)
-are done for one loopback session; the rest are open. Two real packets are already unit
-tests in `crypto.rs`.
+Status after [9] and [10]:
 
-1. Handshake log: run `mosh-server new -s -c 256 -l LANG=en_US.UTF-8` via ssh, store
-   the `MOSH CONNECT` line with a throwaway key (fresh key per recording, so the
-   key in the repo is worthless).
-2. Crypto known-answer: capture datagrams with `tcpdump -w`. With the known key,
-   decrypt and check the tag verifies, for 20+ packets in both directions. Done once
-   (45 packets). Also add an independent OCB3 vector test of the primitive (RFC 7253
-   appendix vectors) to separate "my OCB is wrong" from "my nonce is wrong".
-3. Fragment vectors: force a large screen update (`cat` of a big file, `htop` at a
-   big size, or a colour dump on a 250x80 window) so the server fragments. Record header
-   bytes, final flag, fragment numbers, MTU, the plaintext length before and after zlib.
-   Settles U5, U6.
-4. Instruction vectors: decrypt, inflate, hex-dump the protobuf, and decode with
-   `protoc --decode_raw`. Record protocol version, state numbers over a session, ack
-   and throwaway progression, chaff lengths, shutdown numbers (send `exit` in the
-   shell). Done once; repeat with loss.
-5. Timing: from the capture, tabulate server send intervals vs measured RTT (use
-   `tc netem` for 0/50/200 ms), heartbeat spacing on an idle session, ack delay, and
-   the echo-ack lag. Compare with sections 3-4 numbers. Settles U9, U12, U13.
-6. Roaming: change the client source port/address mid-session; confirm the server
-   follows after one authentic higher-sequence datagram. Test also a replayed
-   old-sequence packet from the new address (must not re-target).
-7. VT recordings: for each scenario, store the sequence `(old_num, new_num, diff
-   bytes)` plus the final screen as a text dump of cells/attributes/cursor. Scenarios:
-   shell prompt; `ls --color`; `vim` (scroll region); `htop`; `less`; wide characters,
-   emoji, combining marks; line wrap at the right edge; resize during output; `reset`;
-   bell; title; mouse mode toggles; bracketed paste toggles. Run them against the
-   interpreter and compare to a reference: the same byte stream through a standard
-   terminal emulator (any permissive-licensed headless one) is only a sanity check,
-   since the server's diff output is what moche must accept. Settles U15.
-8. Skipped states: record a session with `tc netem` loss, so `old_num` is not the
-   previous `new_num`; unit-test the state map and throwaway behaviour. Settles U11, U13.
-9. Negative tests: bad tag, truncated packet, duplicated fragment, missing final
-   fragment, unknown protobuf fields, instruction with unknown `old_num`, version
-   mismatch.
+1. Handshake log: DONE for the key format (the container and the throwaway-key flow).
+   Run `mosh-server new -s -c 256 -l LANG=en_US.UTF-8` via ssh, store the
+   `MOSH CONNECT` line with a throwaway key (fresh key per recording, so the key in the
+   repo is worthless). Round 2 ran without sshd (fake `SSH_CONNECTION`); an ssh-driven
+   run is still to do for the end-to-end CI.
+2. Crypto known-answer: DONE for 45 + 53 + 16 packets (both directions, one captured
+   session per file). Remaining: add an independent OCB3 vector test of the primitive
+   (RFC 7253 appendix vectors) to separate "my OCB is wrong" from "my nonce is wrong".
+3. Fragment vectors: DONE (`frag`: 5 multi-fragment messages, 19 non-final fragments).
+   Remaining: turn them into unit vectors (reassembly, one-zlib-stream inflate).
+4. Instruction vectors: DONE for field numbers, version, chaff, shutdown, loss. Repeat
+   when a second server version is available.
+5. Timing: DONE on loopback with netem delay (0 / 50 / 200 ms), idle heartbeat, delayed
+   ack, resend spacing, echo ack. Exact RTO and send-interval constants and a real
+   network remain open (U9).
+6. Roaming: NOT DONE (U17). Change the client source port/address mid-session; confirm
+   the server follows after one authentic higher-sequence datagram. Test also a replayed
+   old-sequence packet from the new address (must not re-target). Needs a container with
+   nft/iptables for SNAT, or a second `lo` alias.
+7. VT recordings: PARTIAL. Done in round 1 or 2: shell prompt, `ls --color`, `vim`,
+   `htop`, a 256-colour dump, truecolor, attributes, wide characters and emoji,
+   combining marks, resize at idle, bell, title, mouse mode toggles, bracketed paste
+   toggles, cursor visibility, the alternate-screen test. No evidence in the notes for:
+   `less`, line wrap at the right edge, resize during output, `reset`. For each scenario
+   store `(old_num, new_num, diff bytes)` plus the final screen as a text dump of
+   cells/attributes/cursor, run them against the interpreter, and use a standard
+   permissive-licensed headless terminal emulator only as a sanity check, since the
+   server's diff output is what moche must accept. Settles U15.
+8. Skipped states and loss: DONE for the sender side (one capture, delay 25 ms plus 15%
+   loss: skipped `new_num`, cumulative diffs, resends, shutdown under loss). Remaining:
+   unit-test the state map, throwaway and the receiver rule for `old_num` in section 4
+   with the loss capture as vectors, and the in-flight-base pattern from `frag`.
+9. Negative tests: NOT DONE, against a real server or as unit tests: bad tag (server's
+   reaction, U12), truncated packet, duplicated fragment, missing final fragment,
+   fragments out of order (receiver-side reorder, U18), unknown protobuf fields,
+   instruction with unknown `old_num`, version mismatch (U12), and a client that stops
+   sending for more than 12 s (U19).
 
 ## 8. Unverified: confirm by observing a real mosh-server
 
-Resolved by capture [9] and moved into sections 1-6: U1, U2, U3, U4, U7, U8, U10, U14,
-U16 (marked RESOLVED (observed); the evidence is in `docs/observations.md` under the
-same ids). Ids below are stable and not renumbered. Each open item blocks something
-specific; keep it behind one named constant or function.
+Resolved by captures [9, 10] and moved into sections 1-6: U1, U2, U3, U4, U5, U6, U7,
+U8, U10, U14, U16 (marked RESOLVED (observed); the evidence is in
+`docs/observations.md` and `docs/observations-round2.md` under the same ids or sections).
+Ids are stable and not renumbered; U17-U19 are new in draft 3. Each open item blocks
+something specific; keep it behind one named constant or function.
 
 | # | Status and what is still open | Test still needed |
 |---|-------|-------------|
-| U5 | PARTIAL. Layout seen: 10 bytes = u64 BE id + u16 BE flags, top bit final, low 15 bits number (sec. 3). Only single-fragment messages exist in the capture (flags always `0x8000`), so the bit split, maximum fragment number, reassembly order and whether ids relate across fragments of one instruction are inferred, not exercised. | Capture a fragmented update (test 3: large screen, big `cat`, or a smaller path MTU) and check non-final flags, numbering from 0, shared id across fragments. |
-| U6 | PARTIAL. Known: zlib framing (RFC 1950, `78 9c`), header inside the encrypted plaintext, zlib immediately after the header. Order compress-then-fragment-then-encrypt is INFERRED (never fragmented). Open: whether each fragment is compressed separately, default send MTU, receive MTU, chunk size (largest datagram was 443 bytes). | Same fragmented capture: inflate a reassembled group vs inflate each fragment; read datagram sizes at the split. |
-| U9 | OPEN. RTO upper clamp; clamps of the frame interval at very low or very high RTT; the client's actual ack delay at non-trivial RTT. Also see the 50 ms floor contradiction in sec. 4 (resends 21-28 ms apart on loopback). | Timing capture under `tc netem` at 0/50/200 ms (test 5); tabulate resend gaps vs SRTT. |
-| U11 | PARTIAL. Observed: throwaway = highest own-stream number the peer acked, `old_num >= throwaway` always, so receiver keeps state `throwaway_num` and drops strictly below (sec. 4). No loss case seen; "must the receiver retain the base of any in-flight diff beyond that" is unproven. | Loss run (test 8): confirm `old_num >= throwaway` still holds and a discard-below rule never loses a needed base. |
-| U12 | OPEN. Minimum a stock server tolerates from a client: ack and heartbeat timings, whether chaff is required, what the server does with a client that sends no heartbeat, with a wrong protocol version, or with a bad tag. Single-session timings (ack ~100 ms, heartbeat ~3 s) are consistent with [1] but prove nothing about tolerance. | Run the CLI with timings off by 2x and with chaff omitted; watch for server timeouts or drops. Send a modified version field. |
-| U13 | PARTIAL. One resend case: same (old=12, new=14) three times, new wire numbers and ids, different chaff. Trigger rule and diff base (last acked vs last sent) under real loss are open. | Capture with loss; inspect `old_num` on resends and the gap vs RTO. |
-| U15 | PARTIAL. Escape sequences seen are listed in sec. 6 (one session, basic SGR, no 256-colour, no alternate screen, no wide characters or combining marks, no mouse modes beyond reset). The full set the server emits is unknown. | Collect all distinct sequences across the test 7 scenarios and generate the interpreter's coverage list from the data. |
+| U9 | PARTIAL. Observed (r2 §B): frame interval about RTT/2 + 5-8 ms with a floor of about 20 ms at low RTT (20 / 32 / 105 ms at RTT 0 / 50 / 200); resend per frame slot, no backoff; delayed ack about 100 ms; idle heartbeat about 3.0 s at every RTT. Still open: the exact RTO and send-interval constants (the 5-8 ms offset, a ceiling above 105 ms, any RTO upper clamp, whether the paper's 50 ms RTO floor exists in 1.4.0, see the flagged contradiction in sec. 4), ack-delay constants beyond "about 100 ms", the 50 ms echo-ack pacing constant, behaviour on a real (non-loopback) network, jitter. | A run over a real LAN or WAN path with jitter, plus netem at 400 ms and above; tabulate resend gaps vs SRTT. |
+| U11 | PARTIAL. Observed: throwaway = highest own-stream number the peer acked; `old_num >= throwaway` always (round 1 exhaustively; loss capture on the first and last ~50 packets); so keep state `throwaway_num` and drop strictly below. Not exhaustively checked on all 262 loss-capture packets, and "never lose a needed base" depends on U13. | Check `old_num >= throwaway_num` over every instruction of the loss and `frag` captures; add as a unit test over the pulled vectors. |
+| U12 | OPEN. Minimum a stock server tolerates from a client: ack and heartbeat timings, whether chaff is required, what the server does with a client that sends no heartbeat, with a wrong protocol version (U8), or with a bad tag. Timings (ack about 100 ms, heartbeat about 3 s) are consistent with [1] and both rounds but prove nothing about tolerance. | Run the CLI with timings off by 2x and with chaff omitted; watch for server timeouts or drops. Send a modified version field and a corrupted tag. |
+| U13 | PARTIAL. Observed in detail: resends repeat (old, new) with fresh wire counter, `frag_id` and chaff; new input gets a fresh `new_num` and a cumulative diff from the last acked `old`; `new_num` can skip under loss; shutdown is repeated until acked. OPEN QUESTION: the server's rule for choosing `old_num`. In the `frag` burst it diffed each state from the previous in-flight state (old 9..13 for new 10..14, `thr` 8, latest client ack 8); in `rtt50` and the loss capture it kept the last acked state. The receiver rule that follows (apply any diff whose base is held; never assume old_num == last acked) is in sec. 4; the trigger is untested (size or fragmentation, spacing vs SRTT, per-state decision). | Targeted captures: a burst of large messages at RTT 50 and 0, and a burst of small ones, noting `old` vs the last ack received; compare with fragmented vs unfragmented diffs. |
+| U15 | PARTIAL. Escape sequences seen across both rounds are listed in sec. 6 (SGR classic, 256-colour, truecolor, bold/underline/reverse/italic, strikethrough dropped, wide characters and combining marks as raw UTF-8, mouse, bracketed paste, cursor visibility, BEL, titles, no alternate screen, erase characters). The full set the server emits is still unknown (scenarios in test 7 not yet run: `less`, wrap at the right edge, resize during output, `reset`), and which Unicode width table the server's emulator uses is not observable. | Collect all distinct sequences across the remaining test 7 scenarios and generate the interpreter's coverage list from the data; compare cell widths on a set of ambiguous-width characters. |
+| U17 | OPEN (new). Roaming: no source address or port change was exercised in either round; the server re-targeting to a new source, ignoring a replayed lower sequence number from another address, and the first-send latency after a change are all sourced [1 s2.2] only. | Test 6: SNAT or second `lo` alias mid-session. |
+| U18 | OPEN (new). Receiver side of fragmentation: out-of-order, duplicated, lost or missing-final fragments, and how long a server keeps a partial message, are not observed (only the sender side). moche's reassembly in sec. 3 is its own choice. Also whether the server ever changes its chunk size (the 1280 MTU reading is an inference). | Inject reordered, duplicated and dropped fragments toward a real server from the CLI; read the server's reaction in later `ack_num`s. |
+| U19 | OPEN (new). Server behaviour beyond 12 s after the client vanishes: in the one run (r2 §D) the server kept sending an empty frame about every 3.0 s with `new` incrementing and `old`, `thr` frozen, no backoff, no shutdown, and the process alive after 12 s. Its idle timeout (including any network-timeout environment variable) is untested. Also: whether a returning client (a different address, a long gap) is resumed with a diff against its old state, which moche's resume-without-reauth story depends on. | Kill the client for 30 s / 5 min / over the default timeout, then resume from a saved session state; record what the server sends. |
 
-Residual gaps on RESOLVED items (all single-capture; none blocks the first screen):
+Residual gaps on RESOLVED items (none blocks the first screen):
 
-- U10: client-initiated shutdown, and client behaviour after the server's final
-  frame, not observed.
-- U16: no timestamp wrap captured; a real timestamp value of 65535 vs the `0xffff`
-  "none" marker is not disambiguated; cross-host clock epoch is not observable.
+- U5: maximum fragment number seen is 8 (9 fragments); the full 15-bit range is
+  untested; receiver side is U18.
+- U6: the 1214-byte chunk and the 1280 MTU reading are for this build only; the MTU
+  link is an inference (sec. 3). Whether a sender ever splits differently is U18.
+- U10: client-initiated shutdown, and client behaviour after the server's final frame,
+  not observed.
+- U16: one timestamp wrap seen (client, 65384 to 732) with normal handling; a real
+  timestamp value of 65535 vs the `0xffff` "none" marker is still not disambiguated;
+  cross-host clock epoch is not observable.
 - U8: server reaction to a version mismatch is untested (covered by U12's test).
 - U2-U4: only server 1.4.0 on loopback; a different server version could in principle
   differ. 8-byte tag length was not tried.
+- U14: the host-bytes and echo-ack findings stand; the round 1 statement that the server
+  diffs from the last acked state is refined, not removed, by U13.
 
-Count: 7 items open or partial (U5, U6, U9, U11, U12, U13, U15); 9 resolved by
-observation (U1, U2, U3, U4, U7, U8, U10, U14, U16). The byte layouts that block the
-first handshake (U1-U5, U7, U16) are now all settled except the multi-fragment part of
-U5; the rest affect robustness and tuning, not the first screen.
+Corrections made while folding in round 2 (flagged, not silent):
+
+1. Round 1 / earlier protocol.md: "`frag_id` equals the wire counter + 1" and the moche
+   rule "a counter that increases for each DATAGRAM built". Round 2 shows the id is per
+   INSTRUCTION (shared by fragments, +1 per instruction, fresh on resend) while wire
+   counters are per datagram. Round 1 itself noted the two readings were
+   indistinguishable at one datagram per instruction; the moche rule was changed.
+2. Round 1 / earlier protocol.md: "Server instructions diff from the last state the
+   client acked" (obs U14). Round 2 shows a second pattern (previous in-flight state,
+   capture `frag`); the first holds in the other captures. See U13 and the receiver rule.
+3. Sourced [1 s2.2]: minimum RTO 50 ms. Observed resends at 21-41 ms at RTT about 1 and 50
+   ms; resend pacing is the frame interval, not an RTO. Unresolved; see the flagged
+   paragraph in sec. 4.
+4. Round 1: heartbeat "about 2.9-2.95 s". Round 2 measured the gap between empty frames
+   at about 3.0 s (2996-3017 ms). Not a contradiction, a refinement of what was
+   measured against what.
+5. Round 1: largest datagram 443 bytes and "MTU and chunk size open". Superseded: 1252.
+6. Round 1 U15: "no 256-colour". Superseded (observed in round 2); round 1's absence was
+   specific to its session script.
+7. Round 1 "no alternate screen" stands and is extended; no contradiction.
+
+Count: 8 items open or partial (U9, U11, U12, U13, U15, U17, U18, U19); 11 resolved by
+observation (U1, U2, U3, U4, U5, U6, U7, U8, U10, U14, U16). Of the original 16 questions,
+11 are resolved and 5 remain (U9, U11, U12, U13, U15); U17-U19 were opened by round 2.
+Every byte layout that blocks the first handshake and the first screen (U1-U8, U10, U14,
+U16) is now settled; what remains affects robustness, tuning and the roaming/resume
+story, not the first screen.
