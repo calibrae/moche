@@ -10,8 +10,6 @@ publish.workspace = true
 
 [dependencies]
 base64.workspace = true
-
-[dev-dependencies]
 aes.workspace = true
 ocb3.workspace = true
 flate2.workspace = true

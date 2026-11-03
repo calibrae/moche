@@ -6,6 +6,7 @@
 
 pub mod crypto;
 pub mod network;
+pub mod proto;
 pub mod screen;
 pub mod ssp;
 pub mod vt;
