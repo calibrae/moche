@@ -40,6 +40,7 @@ cd swift && xcodebuild test -scheme Moche -destination 'platform=iOS Simulator,n
 pump after every event.
 
 ```swift
+import Foundation
 import Moche
 import SwiftTerm
 

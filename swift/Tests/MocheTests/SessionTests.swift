@@ -74,7 +74,9 @@ final class SessionTests: XCTestCase {
                 n += 1
             }
         }
-        XCTAssertGreaterThan(n, 50)
+        // Large input is paced (adaptive state size, RTO-paced resends), so only a few
+        // dozen datagrams leave in the first two seconds; the point is "many, all small".
+        XCTAssertGreaterThan(n, 10)
     }
 
     func testJunkDatagramsAreDroppedWithoutThrowing() throws {
