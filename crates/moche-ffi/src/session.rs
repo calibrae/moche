@@ -39,6 +39,15 @@ pub struct ModeSnapshot {
     pub alt_screen: bool,
 }
 
+/// Backlog and counters, counters saturated to `u32`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub queued_bytes: u64,
+    pub send_errors: u32,
+    pub rx_errors: u32,
+    pub rx_gaps: u32,
+}
+
 pub struct Core {
     transport: Transport,
     cipher: Cipher,
@@ -255,6 +264,16 @@ impl Core {
     pub fn since_contact(&mut self, now: u64) -> u64 {
         let now = self.clock(now);
         now - self.last_contact.unwrap_or(self.created).min(now)
+    }
+
+    pub fn stats(&self) -> StatsSnapshot {
+        let sat = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        StatsSnapshot {
+            queued_bytes: self.transport.queued_bytes(),
+            send_errors: sat(self.transport.send_errors()),
+            rx_errors: sat(self.transport.rx_errors()),
+            rx_gaps: sat(self.transport.rx_gaps()),
+        }
     }
 
     pub fn srtt_ms(&self) -> u32 {

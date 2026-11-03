@@ -420,6 +420,109 @@ fn modes_and_initial_paint() {
     assert_eq!(moche_session_free(s), MOCHE_OK);
 }
 
+#[test]
+fn stats_fresh_session_is_zero_and_args_are_checked() {
+    let s = new_session(80, 24, 0);
+    let mut st = MocheStats {
+        queued_bytes: 7,
+        send_errors: 7,
+        rx_errors: 7,
+        rx_gaps: 7,
+        reserved: [7; 5],
+    };
+    assert_eq!(moche_session_stats(s, &mut st), MOCHE_OK);
+    assert_eq!(
+        (st.queued_bytes, st.send_errors, st.rx_errors, st.rx_gaps),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(st.reserved, [0; 5]);
+    assert_eq!(moche_session_stats(s, null_mut()), MOCHE_ERR_ARG);
+    assert_eq!(moche_session_stats(null_mut(), &mut st), MOCHE_ERR_ARG);
+    assert_eq!(std::mem::size_of::<MocheStats>(), 40);
+    assert_eq!(moche_session_free(s), MOCHE_OK);
+}
+
+/// A server ack for client state `n`, as a datagram (empty diff).
+fn server_ack(srv: &Cipher, seq: u64, n: u64) -> Vec<u8> {
+    use moche_core::network::{fragment, Inner};
+    use moche_core::proto::{encode_diff, Instruction};
+    let i = Instruction {
+        version: 2,
+        old_num: 0,
+        new_num: 1,
+        ack_num: n,
+        throwaway_num: 0,
+        diff: encode_diff(&[]),
+        chaff: vec![],
+    };
+    let frag = fragment(seq + 1, &i.encode()).unwrap().remove(0);
+    let inner = Inner {
+        ts: 0,
+        ts_reply: None,
+        frag,
+    };
+    srv.seal(Direction::ToClient, seq, &inner.encode()).unwrap()
+}
+
+/// Highest client state number carried by a client datagram (single-fragment
+/// messages only: returns None for a fragment that is not the whole message).
+fn client_state_num(c: &Cipher, d: &[u8]) -> Option<u64> {
+    use moche_core::network::{Inner, Reassembler};
+    use moche_core::proto::Instruction;
+    let o = c.open(d).ok()?;
+    let inner = Inner::decode(&o.plaintext).ok()?;
+    let m = Reassembler::default().push(inner.frag).ok()??;
+    Some(Instruction::decode(&m).ok()?.new_num)
+}
+
+fn stats_of(s: *mut MocheSession) -> MocheStats {
+    let mut st = MocheStats::default();
+    assert_eq!(moche_session_stats(s, &mut st), MOCHE_OK);
+    st
+}
+
+#[test]
+fn stats_queued_bytes_grows_with_paste_and_drains_on_ack() {
+    let s = new_session(80, 24, 0);
+    let cipher = Cipher::new(&Session::from_base64(KEY).unwrap());
+    let big = vec![b'a'; 200_000];
+    assert_eq!(
+        moche_session_send_keys(s, 0, big.as_ptr(), big.len()),
+        MOCHE_OK
+    );
+    assert_eq!(stats_of(s).queued_bytes, big.len() as u64);
+
+    let (mut now, mut seq) = (0u64, 0u64);
+    let mut last = stats_of(s).queued_bytes;
+    let mut shrank = false;
+    for _ in 0..2000 {
+        now += 250;
+        let mut top = 0;
+        while let Some(d) = poll(s, now) {
+            top = top.max(client_state_num(&cipher, &d).unwrap_or(0));
+        }
+        if top > 0 {
+            let ack = server_ack(&cipher, seq, top);
+            seq += 1;
+            assert_eq!(
+                moche_session_handle_datagram(s, now, ack.as_ptr(), ack.len()),
+                MOCHE_OK
+            );
+        }
+        let q = stats_of(s).queued_bytes;
+        assert!(q <= last, "queue never grows by itself");
+        shrank |= q < last;
+        last = q;
+        if q == 0 {
+            break;
+        }
+    }
+    assert!(shrank, "acks must drain the queue");
+    assert_eq!(last, 0, "queue drains to zero");
+    assert_eq!(stats_of(s).send_errors, 0);
+    assert_eq!(moche_session_free(s), MOCHE_OK);
+}
+
 // ---- replay of the stock mosh-server captures through the C API ----
 
 fn rd32(b: &[u8], le: bool) -> u32 {

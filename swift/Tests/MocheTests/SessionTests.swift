@@ -85,6 +85,16 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(try s.handleDatagram(Data(repeating: 0xff, count: 1500), nowMs: 1004))
     }
 
+    func testStatsFreshIsZeroAndQueueGrowsWithKeys() throws {
+        let s = try makeSession()
+        XCTAssertEqual(try s.stats(), MocheStats())
+        try s.sendKeys(Data(repeating: 0x61, count: 1 << 20), nowMs: 1000)
+        let st = try s.stats()
+        XCTAssertGreaterThan(st.queuedBytes, 0)
+        XCTAssertEqual(st.sendErrors, 0)
+        XCTAssertEqual(st.rxErrors, 0)
+    }
+
     func testResize() throws {
         let s = try makeSession()
         try s.sendResize(cols: 120, rows: 40, nowMs: 1000)

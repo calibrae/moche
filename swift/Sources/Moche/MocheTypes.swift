@@ -18,6 +18,22 @@ public struct MocheModes: Sendable, Equatable {
     public init() {}
 }
 
+/// Input backlog and transport counters, from `MocheSession.stats()`.
+public struct MocheStats: Sendable, Equatable {
+    /// Input bytes (keystrokes, paste) the server has not acknowledged yet. Stop feeding a
+    /// big paste while this exceeds a few hundred KB and resume when it drains: whatever is
+    /// typed afterwards (a Ctrl-C!) waits behind it in the ordered stream.
+    public var queuedBytes: UInt64 = 0
+    /// Frames that could not be built. Should stay 0; nonzero means input is stuck.
+    public var sendErrors: UInt32 = 0
+    /// Server messages dropped as malformed or over a limit.
+    public var rxErrors: UInt32 = 0
+    /// Server updates not applied because their base state was missing. Benign.
+    public var rxGaps: UInt32 = 0
+
+    public init() {}
+}
+
 /// Events reported by `MocheSession.takeEvents()`.
 ///
 /// `bell`, `title` and `resized` are one-shot; `outOfSync` and `shutdown` are

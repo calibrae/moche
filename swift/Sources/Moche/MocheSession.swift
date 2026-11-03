@@ -143,6 +143,23 @@ public final class MocheSession {
         return (c, r)
     }
 
+    // MARK: backpressure
+
+    /// Input backlog and transport counters. Poll it from your pump to pace a big paste:
+    /// feed the next slice only while `queuedBytes` is below a few hundred KB.
+    /// - Throws: `.sessionDead` if the session died after an internal error.
+    public func stats() throws -> MocheStats {
+        var c = MocheFFI.MocheStats()
+        let rc = moche_session_stats(handle, &c)
+        if rc != MOCHE_OK { throw MocheError.make(rc) }
+        var s = MocheStats()
+        s.queuedBytes = c.queued_bytes
+        s.sendErrors = c.send_errors
+        s.rxErrors = c.rx_errors
+        s.rxGaps = c.rx_gaps
+        return s
+    }
+
     // MARK: link health
 
     /// Milliseconds since the last new authentic datagram from the server (or since

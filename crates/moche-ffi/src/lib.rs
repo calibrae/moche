@@ -84,6 +84,18 @@ pub struct MocheModes {
     pub alt_screen: u8,
 }
 
+/// Input backlog and transport counters, see `moche.h`. 40 bytes, 8-aligned,
+/// no padding: `queued_bytes` (8) + three `u32` (12) + `reserved[5]` (20).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MocheStats {
+    pub queued_bytes: u64,
+    pub send_errors: u32,
+    pub rx_errors: u32,
+    pub rx_gaps: u32,
+    pub reserved: [u32; 5],
+}
+
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
 }
@@ -520,6 +532,25 @@ pub extern "C" fn moche_session_ms_since_last_contact(
 pub extern "C" fn moche_session_srtt_ms(s: *mut MocheSession, out: *mut u32) -> i32 {
     run_s(s, |core| {
         put(out, core.srtt_ms())?;
+        Ok(MOCHE_OK)
+    })
+}
+
+/// Input backlog (backpressure) and transport counters.
+#[no_mangle]
+pub extern "C" fn moche_session_stats(s: *mut MocheSession, out: *mut MocheStats) -> i32 {
+    run_s(s, |core| {
+        let c = core.stats();
+        put(
+            out,
+            MocheStats {
+                queued_bytes: c.queued_bytes,
+                send_errors: c.send_errors,
+                rx_errors: c.rx_errors,
+                rx_gaps: c.rx_gaps,
+                reserved: [0; 5],
+            },
+        )?;
         Ok(MOCHE_OK)
     })
 }

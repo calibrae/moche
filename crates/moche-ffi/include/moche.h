@@ -62,6 +62,12 @@
  *   //   - the user typed / pasted       -> moche_session_send_keys
  *   //   - the view changed size         -> moche_session_send_resize
  *   //   - the timer fired
+ *   //
+ *   // BACKPRESSURE for big pastes: do not hand a whole paste to
+ *   // moche_session_send_keys at once. Feed it in slices (say 64 KiB) from your
+ *   // pump while moche_session_stats(...).queued_bytes is below a few hundred
+ *   // KB, and resume when it drains. Everything typed afterwards (a Ctrl-C!)
+ *   // waits behind the queued bytes in the ordered stream.
  *   void pump(MocheSession *s, uint64_t now) {
  *       MocheBytes d;
  *       while (moche_session_poll_transmit(s, now, &d) == MOCHE_OK) {
@@ -75,6 +81,8 @@
  *       }
  *       uint32_t ev;  moche_session_take_events(s, &ev);   // bell, shutdown...
  *       MocheModes m; moche_session_modes(s, &m);          // for the key row
+ *       MocheStats st; moche_session_stats(s, &st);        // paste pump: feed
+ *       // more of a pending paste only while st.queued_bytes < ~256 KiB
  *       uint64_t dl;
  *       if (moche_session_next_deadline_ms(s, &dl) == MOCHE_OK)
  *           arm_timer_at(dl);                    // fire at max(dl - now, 0) ms
@@ -213,6 +221,17 @@ typedef struct MocheModes {
     uint8_t alt_screen;       /* 1: a full-screen program is running */
 } MocheModes;
 
+/* Input backlog and transport counters (moche_session_stats). 40 bytes, 8-byte
+ * aligned, no padding; new fields are taken from `reserved`, which is always
+ * zero for now. All counters are cumulative for the session. */
+typedef struct MocheStats {
+    uint64_t queued_bytes;  /* input bytes (keys/paste) not yet acked by the server */
+    uint32_t send_errors;   /* frames that could not be built; should stay 0 */
+    uint32_t rx_errors;     /* server messages dropped as malformed or over-limit */
+    uint32_t rx_gaps;       /* server updates not applied, base state missing */
+    uint32_t reserved[5];   /* zero */
+} MocheStats;
+
 /* ---- general ------------------------------------------------------------ */
 
 /* Library version, a NUL-terminated static string. */
@@ -320,6 +339,22 @@ int32_t moche_session_ms_since_last_contact(MocheSession *s, uint64_t now_ms,
 
 /* Smoothed round-trip time in milliseconds (1000 until the first sample). */
 int32_t moche_session_srtt_ms(MocheSession *s, uint32_t *out);
+
+/* ---- backpressure and diagnostics --------------------------------------- */
+
+/* Fills *out (see MocheStats).
+ *  - queued_bytes: input bytes accepted by moche_session_send_keys that the
+ *    server has not acknowledged yet. A host should stop feeding a big paste
+ *    while this exceeds a few hundred KB and resume when it drains: everything
+ *    typed afterwards (a Ctrl-C!) waits behind it in the ordered stream.
+ *  - send_errors: frames that could not be built. Should stay 0; nonzero means
+ *    input is stuck.
+ *  - rx_errors: server messages dropped as malformed or over a limit.
+ *  - rx_gaps: server updates not applied because their base state was missing;
+ *    the transport re-acks what it holds. Benign, informational.
+ * Counters saturate at UINT32_MAX. Returns MOCHE_OK, MOCHE_ERR_ARG (NULL s or
+ * out) or MOCHE_ERR_DEAD. */
+int32_t moche_session_stats(MocheSession *s, MocheStats *out);
 
 #ifdef __cplusplus
 }

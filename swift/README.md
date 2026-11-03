@@ -48,6 +48,9 @@ actor MoshConnection {
     private let send: @Sendable (Data) -> Void     // UDP send (errors ignored: SSP resends)
     private let paint: @Sendable (Data) -> Void    // feed the terminal view
     private var timer: Task<Void, Never>?
+    private var paste = Data()                     // not yet handed to the session
+    private let pasteSlice = 64 * 1024
+    private let maxQueued: UInt64 = 256 * 1024     // backpressure threshold
     private let clock = ContinuousClock()
     private let t0 = ContinuousClock.now
 
@@ -67,22 +70,43 @@ actor MoshConnection {
 
     func received(_ datagram: Data) { _ = try? session.handleDatagram(datagram, nowMs: now()); pump() }
     func typed(_ bytes: Data)       { try? session.sendKeys(bytes, nowMs: now()); pump() }
+    func pasted(_ bytes: Data)      { paste.append(bytes); pump() }   // big pastes go through the pump
     func resized(cols: UInt16, rows: UInt16) { try? session.sendResize(cols: cols, rows: rows, nowMs: now()); pump() }
 
     private func pump() {
         let n = now()
+        // Paste pump: feed slices only while the server keeps up, so a Ctrl-C typed
+        // later does not wait behind megabytes of paste.
+        while !paste.isEmpty, let st = try? session.stats(), st.queuedBytes < maxQueued {
+            let slice = paste.prefix(pasteSlice)
+            paste.removeFirst(slice.count)
+            try? session.sendKeys(Data(slice), nowMs: n)
+        }
         while let d = try? session.pollTransmit(nowMs: n) { send(d) }
         if let p = try? session.takePaint() { paint(p) }
         let ev = session.takeEvents()               // .bell, .title, .shutdown ...
         if ev.contains(.shutdown) { timer?.cancel(); return }
         timer?.cancel()
-        if let dl = try? session.nextDeadlineMs() {
+        // While a paste is paused, also wake up soon: acks re-run the pump too.
+        let resume: UInt64? = paste.isEmpty ? nil : n + 50
+        if let dl = [try? session.nextDeadlineMs(), resume].compactMap({ $0 }).min() {
             let wait = dl > n ? dl - n : 0
             timer = Task { try? await Task.sleep(for: .milliseconds(wait)); self.pump() }
         }
     }
 }
 ```
+
+## Backpressure for pastes
+
+Everything you send is one ordered stream. A multi-megabyte paste handed over in one
+`sendKeys` call means a Ctrl-C typed right after it waits until the whole paste is
+acknowledged (over a lossy link that can take long). So pace pastes: keep your own buffer
+and, in the pump, feed the next slice (64 KiB or so) only while `try session.stats().queuedBytes`
+(input the server has not acked yet) is below a few hundred KB (the sketch uses 256 KiB).
+Keystrokes typed meanwhile still go straight to `sendKeys` and wait behind at most that
+backlog. `stats()` also reports `sendErrors` (should stay 0), `rxErrors` (server messages
+dropped as malformed) and `rxGaps` (updates skipped for a missing base state; benign).
 
 "Connection lost" is a UI decision: `session.msSinceLastContact(nowMs:) > 5000` (the server
 heartbeats about every 3 s). Roaming needs nothing: keep sending from the same or a new

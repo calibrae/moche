@@ -13,6 +13,9 @@
         }                                                                     \
     } while (0)
 
+/* C99 compile-time layout check: a negative array size fails the build. */
+typedef char moche_stats_size_check[sizeof(MocheStats) == 40 ? 1 : -1];
+
 #define KEY "AAECAwQFBgcICQoLDA0ODw"
 
 int main(void) {
@@ -47,7 +50,15 @@ int main(void) {
     memset(key, 0, sizeof key);
 
     /* loopback: keys -> a client datagram with the direction bit clear */
+    MocheStats st;
+    memset(&st, 0xff, sizeof st);
+    CHECK(moche_session_stats(s, &st) == MOCHE_OK);
+    CHECK(st.queued_bytes == 0 && st.send_errors == 0 && st.rx_errors == 0 && st.rx_gaps == 0);
+    for (int i = 0; i < 5; i++) CHECK(st.reserved[i] == 0);
+    CHECK(moche_session_stats(s, NULL) == MOCHE_ERR_ARG);
+    CHECK(moche_session_stats(NULL, &st) == MOCHE_ERR_ARG);
     CHECK(moche_session_send_keys(s, 1000, (const uint8_t *)"ls\r", 3) == MOCHE_OK);
+    CHECK(moche_session_stats(s, &st) == MOCHE_OK && st.queued_bytes == 3);
     uint64_t dl = 0;
     CHECK(moche_session_next_deadline_ms(s, &dl) == MOCHE_OK);
     CHECK(dl >= 1000);
