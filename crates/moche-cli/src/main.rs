@@ -8,6 +8,7 @@ mod status;
 mod term;
 
 use std::io::BufRead;
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -64,18 +65,10 @@ fn main() -> ExitCode {
     };
     drop(key);
 
-    let signals = Signals {
-        term: Arc::new(AtomicBool::new(false)),
-        hup: Arc::new(AtomicBool::new(false)),
+    let signals = match install_signals() {
+        Ok(s) => s,
+        Err(e) => return fail(EXIT_ERROR, &format!("cannot install signal handler: {e}")),
     };
-    for (sig, flag) in [
-        (signal_hook::consts::SIGTERM, &signals.term),
-        (signal_hook::consts::SIGHUP, &signals.hup),
-    ] {
-        if let Err(e) = signal_hook::flag::register(sig, Arc::clone(flag)) {
-            return fail(EXIT_ERROR, &format!("cannot install signal handler: {e}"));
-        }
-    }
 
     let guard = match term::RawGuard::enter(opts.altscreen) {
         Ok(g) => g,
@@ -98,6 +91,27 @@ fn main() -> ExitCode {
         Ok(Outcome::Signal(n)) => ExitCode::from(128 + n as u8),
         Err(e) => fail(EXIT_ERROR, &e),
     }
+}
+
+/// SIGTERM/SIGHUP set a flag; all three of those and SIGWINCH also write to a
+/// self-pipe so the event loop's poll wakes immediately.
+fn install_signals() -> std::io::Result<Signals> {
+    use signal_hook::consts::{SIGHUP, SIGTERM, SIGWINCH};
+    let (tx, rx) = UnixStream::pair()?;
+    tx.set_nonblocking(true)?;
+    rx.set_nonblocking(true)?;
+    let signals = Signals {
+        term: Arc::new(AtomicBool::new(false)),
+        hup: Arc::new(AtomicBool::new(false)),
+        wake: rx,
+    };
+    // Flag first, pipe second: the loop sees the flag when it wakes.
+    signal_hook::flag::register(SIGTERM, Arc::clone(&signals.term))?;
+    signal_hook::flag::register(SIGHUP, Arc::clone(&signals.hup))?;
+    for sig in [SIGTERM, SIGHUP, SIGWINCH] {
+        signal_hook::low_level::pipe::register(sig, tx.try_clone()?)?;
+    }
+    Ok(signals)
 }
 
 /// Returns the UDP target and the key; errors carry their exit code.

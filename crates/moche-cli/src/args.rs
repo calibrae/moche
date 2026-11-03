@@ -8,6 +8,8 @@ options:
   --ssh <cmd>                 ssh program to bootstrap with (default: ssh)
   --ssh-arg <arg>             extra argument for ssh, repeatable
   --server <path>             mosh-server path on the remote (default: mosh-server)
+  --server-lang <locale>      locale for the remote mosh-server, must be UTF-8
+                              (default: en_US.UTF-8; the local LANG is never sent)
   -p, --server-port-range <lo:hi>
                               UDP port range for mosh-server
   --direct HOST PORT          skip ssh: connect to an already running mosh-server
@@ -45,6 +47,8 @@ pub struct Opts {
     pub ssh: String,
     pub ssh_args: Vec<String>,
     pub server: String,
+    /// Requested server locale; `None` means the default.
+    pub server_lang: Option<String>,
     pub port_range: Option<String>,
     pub altscreen: bool,
     /// Hidden debug option: write host diffs straight to the tty.
@@ -63,6 +67,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut ssh = "ssh".to_string();
     let mut ssh_args = Vec::new();
     let mut server = "mosh-server".to_string();
+    let mut server_lang = None;
     let mut port_range = None;
     let mut altscreen = true;
     let mut passthrough = false;
@@ -82,6 +87,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             "--ssh" => ssh = val(&mut it, "--ssh")?,
             "--ssh-arg" => ssh_args.push(val(&mut it, "--ssh-arg")?),
             "--server" => server = val(&mut it, "--server")?,
+            "--server-lang" => server_lang = Some(val(&mut it, "--server-lang")?),
             "-p" | "--server-port-range" => {
                 let r = val(&mut it, "--server-port-range")?;
                 if !valid_range(&r) {
@@ -136,6 +142,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         ssh,
         ssh_args,
         server,
+        server_lang,
         port_range,
         altscreen,
         passthrough,
@@ -194,6 +201,16 @@ mod tests {
             }
         );
         assert!(!o.altscreen);
+    }
+
+    #[test]
+    fn server_lang() {
+        assert_eq!(opts("h").server_lang, None);
+        assert_eq!(
+            opts("--server-lang fr_FR.UTF-8 h").server_lang.as_deref(),
+            Some("fr_FR.UTF-8")
+        );
+        assert!(p("h --server-lang").is_err());
     }
 
     #[test]

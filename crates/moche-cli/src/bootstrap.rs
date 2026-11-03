@@ -44,9 +44,11 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// A locale the server can use: ours if it is UTF-8, else en_US.UTF-8.
-pub fn pick_lang(local: Option<&str>) -> String {
-    match local {
+/// The locale for the remote server: `requested` if it is UTF-8, else
+/// en_US.UTF-8. The client's own LANG is deliberately not consulted: the
+/// server may lack that locale.
+pub fn pick_lang(requested: Option<&str>) -> String {
+    match requested {
         Some(l)
             if {
                 let u = l.to_ascii_lowercase();
@@ -110,7 +112,7 @@ pub fn resolve_host(host: &str, port: u16) -> Result<SocketAddr, String> {
 
 /// Runs ssh + mosh-server; returns (address, key). Errors are user-facing.
 pub fn run(opts: &Opts, dest: &str, command: &[String]) -> Result<(SocketAddr, String), String> {
-    let lang = pick_lang(std::env::var("LANG").ok().as_deref());
+    let lang = pick_lang(opts.server_lang.as_deref());
     let remote = remote_command(opts, &lang, command);
     let mut child = Command::new(&opts.ssh)
         .args(&opts.ssh_args)
@@ -228,6 +230,7 @@ mod tests {
 
     #[test]
     fn lang_choice() {
+        assert_eq!(pick_lang(None), "en_US.UTF-8");
         assert_eq!(pick_lang(Some("fr_FR.UTF-8")), "fr_FR.UTF-8");
         assert_eq!(pick_lang(Some("de_DE.utf8")), "de_DE.utf8");
         assert_eq!(pick_lang(Some("C")), "en_US.UTF-8");

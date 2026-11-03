@@ -78,6 +78,19 @@ impl Status {
     }
 }
 
+/// Next time (ms, same clock as `last_contact`) the status line may need a
+/// redraw, or `None` while the link is healthy enough not to care: from the
+/// moment silence would reach the threshold, then once per second so the
+/// "N s ago" counter keeps moving.
+pub fn next_status_tick_ms(last_contact: u64, now: u64) -> Option<u64> {
+    let silent = now.saturating_sub(last_contact);
+    if silent < SILENCE_MS {
+        Some(last_contact + SILENCE_MS)
+    } else {
+        Some(last_contact + (silent / 1000 + 1) * 1000)
+    }
+}
+
 /// Escape bytes drawing `text` on the bottom row without moving the cursor.
 pub fn draw_status(text: &str, cols: u16, rows: u16) -> Vec<u8> {
     let text: String = text.chars().take(usize::from(cols)).collect();
@@ -133,6 +146,13 @@ mod tests {
         assert!(matches!(s.update(7000, true), StatusUpdate::Show(t) if t.contains("lost")));
         assert_eq!(s.update(7000, false), StatusUpdate::None);
         assert_eq!(s.update(0, false), StatusUpdate::Clear);
+    }
+
+    #[test]
+    fn status_ticks() {
+        assert_eq!(next_status_tick_ms(1000, 1500), Some(6000));
+        assert_eq!(next_status_tick_ms(1000, 6000), Some(7000));
+        assert_eq!(next_status_tick_ms(1000, 7400), Some(8000));
     }
 
     #[test]
