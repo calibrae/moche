@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag or ref to build (dry run: nothing is published)"
+        description: "Branch, tag or ref to build (dry run: nothing is published)"
         required: true
-        default: "v0.1.0"
+        default: "main"
 
 permissions:
   contents: write
