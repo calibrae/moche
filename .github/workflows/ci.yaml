@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain comes from rust-toolchain.toml, installed with the runner's rustup.
+      - name: Rust toolchain
+        run: |
+          set -eu
+          ch=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$ch" --profile minimal -c rustfmt -c clippy
+          rustc --version
+          cargo --version
+
+      - name: cargo-deny
+        run: cargo install --locked cargo-deny
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: licenses
+        run: cargo deny check licenses
+
+      - name: C header matches the library exports
+        run: tools/ffi/check-header.sh
+
+      - name: THIRD_PARTY.md is up to date
+        run: tools/third-party.sh --check
+
+      # End to end against a stock mosh-server, Linux only. Not a gate while it is new.
+      - name: e2e against mosh-server
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y mosh
+          MOCHE_E2E=1 cargo test -p moche-cli --test e2e -- --ignored --nocapture

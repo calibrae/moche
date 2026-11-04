@@ -8,11 +8,14 @@ The CLI ships as three checksummed tarballs: `x86_64-unknown-linux-musl` and
 1. Bump `version` in `[workspace.package]` of `Cargo.toml`; run `cargo build` so `Cargo.lock` follows.
 2. `tools/third-party.sh` to refresh `docs/THIRD_PARTY.md` (shipped in each tarball), then
    `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo deny check licenses`.
-3. Commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
-4. `.gitea/workflows/release.yaml` runs on the tag: builds the three targets, packages, writes
-   `SHA256SUMS`, runs `verify.sh`, creates the Gitea release and uploads the three tarballs plus
-   `SHA256SUMS` through the API. Run the workflow by hand (workflow_dispatch, input `tag`) for a dry
-   run: same build and verification, nothing uploaded.
+3. Commit, then `git tag vX.Y.Z && git push origin vX.Y.Z` (a tag with a suffix, `vX.Y.Z-rc1`, is
+   published as a prerelease).
+4. `.github/workflows/release.yaml` runs on the tag on a GitHub-hosted `macos-14` runner (Apple
+   silicon): it checks that the tag matches `Cargo.toml`, builds the three targets, packages, writes
+   `SHA256SUMS`, runs `verify.sh`, then `gh release create` with the three tarballs and `SHA256SUMS`
+   and generated notes, using the built-in `GITHUB_TOKEN` (`permissions: contents: write`; no secret to
+   set up). Run the workflow by hand (workflow_dispatch, input `tag`) for a dry run: same build and
+   verification, nothing published.
 
 ## Verify a download
 
@@ -44,10 +47,12 @@ Checked 2026-11-04 on a second Mac, fresh clones in different directories, pinne
 
 - Linux tarballs and binaries are bit-for-bit identical across clone paths, hosts and between
   `cargo zigbuild` and the aarch64 linker wrapper, provided the **same rustc** is used (both
-  matched hashes built on rustc 1.95.0). A different rustc changes the binary: the Linux hashes
+  matched hashes built on rustc 1.95.0; the pin is now 1.99.0). A different rustc changes the binary: the Linux hashes
   built with 1.99.0 differ from the 1.95.0 ones. The commit hash and `SOURCE_DATE_EPOCH` are part
   of the input (`GIT_COMMIT` and `SOURCE_DATE_EPOCH` can be exported to rebuild an older identity).
-  To make CI hashes stable, pin the toolchain (a `rust-toolchain.toml` at the repo root, not done yet).
+  `rust-toolchain.toml` pins the toolchain (1.99.0, with rustfmt and clippy), so release builds on any
+  host use the same rustc. The binary embeds the short commit hash, so the same source under a
+  different history (for example a re-exported repository) gives different hashes.
 - The macOS binary is reproducible only when built in the **same absolute directory**: ld64 derives
   `LC_UUID` from the linker inputs, including their paths (`--remap-path-prefix` does not reach the
   linker). Two clones at different paths differ in 16 bytes of `LC_UUID` plus the code-signature
@@ -65,13 +70,11 @@ x86_64 still uses `cargo zigbuild` directly.
 
 ## Runner requirements
 
-- Runner label: set in one place, `runs-on:` in `.gitea/workflows/release.yaml`. Pin it to a runner whose
-  user has rustup, `python3`, `curl`, `shasum` and `tar`, network access to download the pinned zig (about
-  55 MB, first run only) and to crates.io, and a few hundred MB of disk. A runner that executes steps as
-  an unprivileged account works only if that account has a Rust toolchain.
-- Repo secret `RELEASE_TOKEN`: created by the repo owner (Gitea user settings, applications), scope
-  `write:repository`, added as a repository secret. Never commit it.
-- Optional secret/env for macOS signing: `MOCHE_CODESIGN_IDENTITY` (and the identity in the runner's keychain).
+- Release: GitHub-hosted `macos-14` (Apple silicon, rustup, python3, curl, shasum, tar, `gh` are
+  preinstalled), network access to download the pinned zig (about 55 MB), `cargo-zigbuild` and the crates.
+  A self-hosted runner needs the same, plus a few hundred MB of disk.
+- Optional env for macOS signing: `MOCHE_CODESIGN_IDENTITY` (and the identity in the keychain of the
+  build host). Not used by the GitHub workflow: its macOS binary carries the linker's ad-hoc signature.
 
 ## Bumping zig
 

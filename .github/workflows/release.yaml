@@ -1,0 +1,71 @@
+# Release: build, package and publish the moche CLI for three targets.
+#   push tag v*         -> build, verify, create a GitHub release with the tarballs and SHA256SUMS
+#   workflow_dispatch   -> dry run: build and verify the given tag or ref, publish nothing
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag or ref to build (dry run: nothing is published)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14   # Apple silicon: builds aarch64-apple-darwin natively, Linux targets with zig
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Rust toolchain
+        run: |
+          set -eu
+          ch=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$ch" --profile minimal -c rustfmt -c clippy
+          rustc --version
+
+      - name: Tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          v=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -1)
+          [ "$TAG" = "v$v" ] || [ "${TAG#v$v-}" != "$TAG" ] || { echo "tag $TAG does not match version $v" >&2; exit 1; }
+
+      - name: Build and package
+        run: |
+          set -eu
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin; do
+            tools/release/build.sh "$t"
+            tools/release/package.sh "$t"
+          done
+          tools/release/checksums.sh dist
+
+      - name: Verify
+        run: |
+          set -eu
+          v=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -1)
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl aarch64-apple-darwin; do
+            tools/release/verify.sh "dist/moche-$v-$t.tar.gz" "$t"
+          done
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+
+      - name: Publish GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease";; esac
+          gh release create "$TAG" dist/* --generate-notes --verify-tag $pre

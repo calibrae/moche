@@ -1063,14 +1063,12 @@ impl Framebuffer {
 
     fn decaln(&mut self) {
         let a = Attrs::default();
-        for c in &mut self.cells {
-            *c = Cell {
-                ch: 'E',
-                comb: None,
-                width: 1,
-                attrs: a,
-            };
-        }
+        self.cells.fill(Cell {
+            ch: 'E',
+            comb: None,
+            width: 1,
+            attrs: a,
+        });
     }
 
     fn index(&mut self) {

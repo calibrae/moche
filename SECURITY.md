@@ -50,8 +50,8 @@ sequence numbers, not random). `moche-cli` is a dev tool and reads
 
 ## Reporting
 
-Report suspected vulnerabilities privately to the maintainer, not in a public
-issue. Include the version (`moche_version`), a description and, if you can, a
-reproduction (a captured datagram plus a throwaway key is ideal; never send a
-real session key). The contact address will be added here before the
-repository goes public.
+Report suspected vulnerabilities privately through GitHub: on the repository page, open the
+Security tab and choose "Report a vulnerability" (private vulnerability reporting). Do not
+open a public issue. Include the version (`moche --version`, or `moche_version` for the C
+API), a description and, if you can, a reproduction (a captured datagram plus a throwaway
+key is ideal; never send a real session key).
