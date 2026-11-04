@@ -866,3 +866,14 @@ stock client's `brk` 4-step grow/shrink on every key.
   had none (the earlier run's key had been removed), so a throwaway ed25519 key was generated in
   `moche-b` and authorised in `moche-a`, passed with `--ssh-opt -i --ssh-opt KEY --ssh-opt -o --ssh-opt IdentitiesOnly=yes
   --ssh-opt -o --ssh-opt StrictHostKeyChecking=no`, and removed at the end. No change to `tools/` was needed.
+
+## Predictive local echo cost (2026-11-04)
+
+`CARGO_TARGET_DIR=target/perf cargo run --release -p moche-ffi --example predict_bench` (per
+typed key: `on_input`, compose, `on_server_state`). Never: 5 ns, 0 allocations; Adaptive on a fast
+link (inactive): 7 ns, 0 allocations; idle server frame 2-5 ns. Active (slow link): 2.3 us at 80x24,
+14.5 us at 200x60 (one grid copy into the recycled buffer, plus 1 allocation of 8 B in the copy of the
+parser state). Existing `bench` cases before and after the `Transport` input accounting: allocations
+per op identical (keystroke 1.7, small server frame 8.0, heartbeat 7.9), times within 1-3 %.
+The golden scenario is IDENTICAL, and `tests/predict_wire.rs` shows an active predictor changes no
+datagram.

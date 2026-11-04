@@ -181,11 +181,11 @@ fn event_loop(
         }
 
         let t = now();
-        let wait = wait_ms(
-            t,
-            transport.next_deadline_ms(),
-            next_status_tick_ms(last_contact, t),
-        );
+        let deadline = [transport.next_deadline_ms(), display.next_deadline_ms()]
+            .into_iter()
+            .flatten()
+            .min();
+        let wait = wait_ms(t, deadline, next_status_tick_ms(last_contact, t));
         let timeout = rustix::event::Timespec {
             tv_sec: (wait / 1000) as _,
             tv_nsec: ((wait % 1000) * 1_000_000) as _,
@@ -214,6 +214,14 @@ fn event_loop(
                 Ok(n) => {
                     let (keys, quit) = exit_key.feed(&buf[..n]);
                     transport.send_keys(now(), &keys);
+                    if !keys.is_empty() {
+                        display.on_input(
+                            now(),
+                            &keys,
+                            transport.srtt_ms(),
+                            transport.input_bytes_total(),
+                        );
+                    }
                     if quit {
                         return Ok(Outcome::Quit);
                     }
@@ -247,8 +255,14 @@ fn event_loop(
                     }
                 }
                 display.on_throwaway(transport.peer_throwaway());
+                display.on_progress(transport.echoed_input_bytes(), t);
             }
         }
+        display.tick(
+            now(),
+            transport.srtt_ms(),
+            now().saturating_sub(last_contact),
+        );
 
         let out = display.flush();
         if !out.is_empty() {

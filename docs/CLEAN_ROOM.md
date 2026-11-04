@@ -15,6 +15,10 @@ check it, and what the process cannot prove.
 - the API reference pages of one permissively licensed third-party package, used only for
   names and sizes, and each of them confirmed by a capture (`docs/protocol.md`, source [6]).
 
+Predictive local echo (`docs/predict.md`) was designed from the paper's section on
+speculative local echo and from black-box observation of a stock `mosh-client` (what it
+shows, with which attributes, under a simulated delay); mosh's source was not consulted.
+
 ## Rules that were followed
 
 1. No file of mosh's repository (source, `.proto`, tests), no mirror or fork of it, was

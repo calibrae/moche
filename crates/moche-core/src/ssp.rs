@@ -186,7 +186,20 @@ pub struct Transport {
     reply: Option<(u16, u64)>,
     rtt: Rtt,
     shutdown: bool,
+    // input accounting for display-side prediction (read-only for the protocol)
+    /// Cumulative data bytes ever queued with `send_keys`.
+    input_bytes: u64,
+    /// Data bytes in the elements already acked (dropped from `elements`).
+    acked_bytes: u64,
+    /// `(state num, cumulative data bytes it carries)` for sent states not yet
+    /// passed by an echo ack; bounded by `MAX_ECHO_MARKS`.
+    echo_marks: VecDeque<(u64, u64)>,
+    /// Cumulative input bytes the server's echo ack has covered.
+    echoed_bytes: u64,
 }
+
+/// Most `(state, bytes)` marks kept for echo-ack lookup.
+const MAX_ECHO_MARKS: usize = 256;
 
 impl Transport {
     /// Creates a transport for `session`. `now_ms` starts the heartbeat clock;
@@ -226,7 +239,27 @@ impl Transport {
             reply: None,
             rtt: Rtt::default(),
             shutdown: false,
+            input_bytes: 0,
+            acked_bytes: 0,
+            echo_marks: VecDeque::from([(0, 0)]),
+            echoed_bytes: 0,
         }
+    }
+
+    /// Cumulative input bytes ever queued with [`Transport::send_keys`]. Together
+    /// with [`Transport::echoed_input_bytes`] it lets a host tell which of its
+    /// keystrokes the server has had time to echo. Read-only: it changes no
+    /// behaviour of the transport.
+    pub fn input_bytes_total(&self) -> u64 {
+        self.input_bytes
+    }
+
+    /// Cumulative input bytes covered by the server's latest echo ack: the
+    /// server presented them to the application at least about 50 ms ago, so
+    /// any echo should already be in the received state. Monotone; 0 until the
+    /// first echo ack.
+    pub fn echoed_input_bytes(&self) -> u64 {
+        self.echoed_bytes
     }
 
     /// Queues keystrokes (or pasted bytes) for the server.
@@ -297,6 +330,7 @@ impl Transport {
         }
         if let Element::Data(b) = &e {
             self.queued += b.len() as u64;
+            self.input_bytes += b.len() as u64;
         }
         self.elements.push_back(e);
         self.total += 1;
@@ -397,7 +431,10 @@ impl Transport {
                     width,
                     height,
                 }),
-                Element::EchoAck(n) => events.push(Event::EchoAck(n)),
+                Element::EchoAck(n) => {
+                    self.note_echo(n);
+                    events.push(Event::EchoAck(n));
+                }
             }
         }
         events.push(Event::HostDiff {
@@ -411,6 +448,17 @@ impl Transport {
         }
         self.schedule_ack(now_ms);
         events
+    }
+
+    /// Records that the echo ack named state `n`: every input byte up to the
+    /// newest state numbered at most `n` has been presented to the application.
+    fn note_echo(&mut self, n: u64) {
+        let Some(p) = self.echo_marks.iter().rposition(|m| m.0 <= n) else {
+            return;
+        };
+        self.echoed_bytes = self.echoed_bytes.max(self.echo_marks[p].1);
+        // marks below the matched one can never be asked for again
+        self.echo_marks.drain(..p);
     }
 
     /// Plans an ack frame: at once after shutdown, else after `ACK_DELAY_MS`.
@@ -462,6 +510,7 @@ impl Transport {
         for e in self.elements.drain(..drop) {
             if let Element::Data(b) = e {
                 self.queued -= b.len() as u64;
+                self.acked_bytes += b.len() as u64;
             }
         }
         self.acked_count = count;
@@ -615,6 +664,12 @@ impl Transport {
                 let n = self.next_num;
                 self.next_num += 1;
                 self.sent.push_back((n, cut));
+                let cum = self.acked_bytes + self.bytes_to(cut) as u64;
+                if self.echo_marks.len() >= MAX_ECHO_MARKS {
+                    // an echo ack older than the oldest kept mark is ignored
+                    self.echo_marks.pop_front();
+                }
+                self.echo_marks.push_back((n, cum));
                 self.sends = 1;
                 self.first_sent = now_ms;
                 self.shrunk = false;
@@ -984,6 +1039,51 @@ mod tests {
             ]
         );
         assert_eq!(t.peer_throwaway(), 0);
+    }
+
+    #[test]
+    fn echo_ack_maps_to_cumulative_input_bytes() {
+        let mut srv = Server::new();
+        let mut t = transport();
+        assert_eq!((t.input_bytes_total(), t.echoed_input_bytes()), (0, 0));
+        t.send_keys(10, b"abc");
+        t.send_resize(11, 100, 30);
+        t.send_keys(12, b"de");
+        assert_eq!(t.input_bytes_total(), 5);
+        let sent = |t: &mut Transport, srv: &Server, now: u64| {
+            let d = drain(t, now);
+            srv.open_client(&d[0]).2.new_num
+        };
+        let n1 = sent(&mut t, &srv, 40);
+        // the server echoes the first state only: all five bytes were in it
+        // (one state carries everything queued so far), then more keys come
+        t.send_keys(50, b"fgh");
+        let ack = |srv: &mut Server, t: &mut Transport, n: u64, seq: u64| {
+            let i = Server::instr(0, seq, 0, &[Element::EchoAck(n)]);
+            t.handle_datagram(60, &srv.send(0, None, i)[0]);
+        };
+        ack(&mut srv, &mut t, n1, 1);
+        assert_eq!(t.echoed_input_bytes(), 5);
+        // acked frame, then a new state with the new keys
+        let mut now = 100;
+        let n2 = loop {
+            let d = drain(&mut t, now);
+            if let Some(d) = d.first() {
+                let n = srv.open_client(d).2.new_num;
+                if n > n1 {
+                    break n;
+                }
+            }
+            now += 50;
+        };
+        // an echo ack never goes backwards and an unknown future number maps to
+        // the newest state at or below it
+        ack(&mut srv, &mut t, n1, 2);
+        assert_eq!(t.echoed_input_bytes(), 5);
+        ack(&mut srv, &mut t, n2, 3);
+        assert_eq!(t.echoed_input_bytes(), 8);
+        ack(&mut srv, &mut t, n2 + 40, 4);
+        assert_eq!(t.echoed_input_bytes(), 8);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! Command-line parsing (hand rolled: the surface is small).
 
+use moche_core::predict::PredictMode;
+
 pub const USAGE: &str = "\
 usage: moche [options] [user@]host [-- command...]
        moche [options] --direct HOST PORT      (key from $MOSH_KEY or --key-stdin)
@@ -15,6 +17,12 @@ options:
   --direct HOST PORT          skip ssh: connect to an already running mosh-server
   --key-stdin                 with --direct: read the session key from stdin
   --no-altscreen              do not use the terminal's alternate screen
+  --predict <never|adaptive|always>
+                              predictive local echo (also --predict=MODE): show typed
+                              characters before the server echoes them (default:
+                              adaptive, only when the round trip is slow). Unconfirmed
+                              characters are underlined on slow links. `always` can
+                              briefly show text typed where nothing echoes (passwords)
   --stats                     on exit, print transport counters to stderr (queued bytes,
                               send/receive errors, gaps, datagrams and bytes)
   -V, --version               print version
@@ -53,6 +61,8 @@ pub struct Opts {
     pub server_lang: Option<String>,
     pub port_range: Option<String>,
     pub altscreen: bool,
+    /// Predictive local echo mode.
+    pub predict: PredictMode,
     /// Print transport counters to stderr on exit.
     pub stats: bool,
     /// Hidden debug option: write host diffs straight to the tty.
@@ -74,6 +84,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut server_lang = None;
     let mut port_range = None;
     let mut altscreen = true;
+    let mut predict = PredictMode::default();
     let mut stats = false;
     let mut passthrough = false;
     let mut direct: Option<(String, u16)> = None;
@@ -101,6 +112,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 port_range = Some(r);
             }
             "--no-altscreen" => altscreen = false,
+            "--predict" => predict = val(&mut it, "--predict")?.parse()?,
+            s if s.starts_with("--predict=") => predict = s["--predict=".len()..].parse()?,
             "--stats" => stats = true,
             "--passthrough" => passthrough = true,
             "--key-stdin" => key_stdin = true,
@@ -151,6 +164,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         server_lang,
         port_range,
         altscreen,
+        predict,
         stats,
         passthrough,
     })))
@@ -195,6 +209,18 @@ mod tests {
         );
         assert!(o.altscreen);
         assert!(!o.stats);
+    }
+
+    #[test]
+    fn predict_option() {
+        assert_eq!(opts("h").predict, PredictMode::Adaptive);
+        assert_eq!(opts("--predict never h").predict, PredictMode::Never);
+        assert_eq!(opts("--predict=always h").predict, PredictMode::Always);
+        assert_eq!(opts("h --predict=adaptive").predict, PredictMode::Adaptive);
+        assert!(p("--predict bogus h").is_err());
+        assert!(p("--predict=bogus h").is_err());
+        assert!(p("h --predict").is_err());
+        assert!(USAGE.contains("--predict"));
     }
 
     #[test]

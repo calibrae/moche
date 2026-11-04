@@ -558,8 +558,8 @@ moche model (design, to be validated against recordings, section 7):
   modes, title) generated from the current framebuffer. Chosen for v1 because the host
   (SwiftTerm) only needs bytes, and it is stateless and robust against skipped
   states. A minimal diff against the last painted frame is a later optimisation.
-- Predictive local echo: out of v1; the framebuffer is kept separate from any
-  overlay so it can be added.
+- Predictive local echo: a display-only overlay on the latest state, see `docs/predict.md`
+  (the framebuffer and the numbered states are never modified by it).
 
 VT subset (U15). Seen so far across both rounds, on loopback with 1.4.0 only: `ESC[r`,
 `ESC[0m`, `ESC[H`, `ESC[2J`, `ESC[K`, `ESC[nX` (erase characters), `ESC[?25l/h`,

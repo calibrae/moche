@@ -372,6 +372,21 @@ impl Framebuffer {
     pub fn icon_name(&self) -> &str {
         &self.icon_name
     }
+    /// Overwrites one cell with `cell`. Display-side edit for an overlay
+    /// (predicted echo) drawn on a *copy* of a server state; ignored when
+    /// out of range. It does not interpret anything or touch the cursor.
+    pub fn set_cell(&mut self, row: u16, col: u16, cell: Cell) {
+        let (r, c) = (usize::from(row), usize::from(col));
+        if r < self.rows && c < self.cols {
+            self.cells[r * self.cols + c] = cell;
+        }
+    }
+    /// Moves the cursor (clamped to the grid); same purpose as [`Framebuffer::set_cell`].
+    pub fn set_cursor(&mut self, row: u16, col: u16) {
+        self.row = usize::from(row).min(self.rows - 1);
+        self.col = usize::from(col).min(self.cols - 1);
+        self.pending_wrap = false;
+    }
     /// Text of a row, continuation cells skipped, trailing blanks trimmed.
     pub fn row_text(&self, row: u16) -> String {
         let mut s = String::new();

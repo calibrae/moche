@@ -60,7 +60,8 @@ rustup installs it by itself):
 
 Other options: `--server-lang LOCALE` (locale for the remote server, must be UTF-8,
 default `en_US.UTF-8`; the local `LANG` is never sent), `--server PATH`, `--ssh CMD`,
-`--ssh-arg ARG`, `-p LO:HI` (UDP port range), `--no-altscreen`, `--stats` (transport
+`--ssh-arg ARG`, `-p LO:HI` (UDP port range), `--no-altscreen`, `--predict never|adaptive|always`
+(predictive local echo, default `adaptive`: see [docs/predict.md](docs/predict.md)), `--stats` (transport
 counters on exit), `--help`. Quit with `Ctrl-^` then `.`; `Ctrl-^ Ctrl-^` sends a
 literal `Ctrl-^`.
 
@@ -109,8 +110,10 @@ investigated); wall time for the paste is about the same for both (0.45 s agains
 
 ## Not yet / known gaps
 
-- No predictive local echo (mosh's best-known feature). The core is designed so it can be
-  added later.
+- Predictive local echo (CLI only so far, not in the C API yet) is conservative: it predicts
+  typing at the end of a line, backspace and left/right, but not insertion in the middle of
+  a line, and it has only been validated on loopback with a simulated delay, not on a real
+  WAN. Details and limits: [docs/predict.md](docs/predict.md).
 - Typing echo is about 10 ms slower than stock at the median (28 ms against 17 ms,
   observations round 6): moche waits 8 ms to batch keystrokes.
 - Only tested against `mosh-server` 1.4.0. Other versions are unknown.
