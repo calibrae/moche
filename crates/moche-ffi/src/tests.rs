@@ -239,8 +239,8 @@ fn loopback_keys_are_encrypted_for_the_server() {
     );
     let mut dl = 0u64;
     assert_eq!(moche_session_next_deadline_ms(s, &mut dl), MOCHE_OK);
-    assert!(dl >= 100);
-    assert!(poll(s, 100).is_none(), "collect interval not elapsed");
+    // no collection delay since round 8: the first frame after idle is due at once
+    assert_eq!(dl, 100);
     let mut got = Vec::new();
     while let Some(d) = poll(s, dl + 500) {
         got.push(d);

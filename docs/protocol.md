@@ -330,6 +330,27 @@ of about 1 ms of loopback.
   30, 36, 33 ms) which are probably lost sends or a stretched send interval, not a
   separate timer. No separate RTO is visible.
 
+Client send timing while typing (OBSERVED, round 8, `observations-round8.md`; stock `mosh-client` 1.4.0
+black box, 10 keys/s, one-way delay 5-100 ms on loopback; each "OBSERVED" below is what the stock client did,
+each "moche choice" is ours):
+
+- First key after idle (OBSERVED): the datagram leaves 2-5 ms after the key (the pty wake-up); there is no
+  separate collection delay. Keys that arrive faster than the frame interval wait for it (one datagram for
+  all of them, sent at last send + frame interval; at RTT 100: one datagram per 55 ms).
+- Frame interval (OBSERVED, consistent with the table above): last send of any kind + about SRTT/2 + 6 ms, floor
+  20 ms; it gates NEW data only.
+- Retransmission of an unacked key state (OBSERVED): not at the frame interval. While typing, the stock client
+  re-sent a state only about 100-112 ms after its last send (RTT 100 and 200), once about 145 ms (RTT 100,
+  idle), and almost never otherwise (10 resends for 296 keys at RTT 100, 3 at RTT 200): the next key supersedes
+  the state first. Only one case differs: right after a long silence (nothing received for seconds) the
+  stock client re-sent at the frame interval (57-62 ms at RTT 100, 20-23 ms at RTT 10); moche does not copy that.
+- Delayed ack (OBSERVED): a standalone empty ack goes out 100-119 ms after the FIRST unacked server frame when
+  nothing else was sent; a key frame sent earlier carries the ack, so while typing at 10 keys/s the stock
+  client sent 0 to 5 % standalone acks. The server sent two frames per key about 55 ms apart (data+ack, then
+  an echo-ack frame); the client acks neither on its own.
+- Moche choice: `COLLECT_MS = 0`; small-state resend after `max(frame interval, 110 ms, min(SRTT + 50 ms, 250 ms))`.
+  Big states keep their RTO-based resend interval.
+
 **Contradiction flagged (not overwritten): RTO floor.** [1] gives a 50 ms minimum
 retransmission timeout. Round 1 saw resends 21 and 28 ms apart (RTT about 1 ms). Round 2
 does not remove the contradiction: at RTT 50 the median resend gap is 32 ms (26-41),
@@ -386,8 +407,10 @@ server.** Constants are named and live in one place:
    concatenation of every input event after the acked state, in order, with the current
    `ack_num` and `throwaway_num`, and a random chaff length 0-16 (U12: whether chaff
    is required is untested).
-4. Resend (r2 §B, §C): while the last instruction is unacked, at each frame slot send it
-   again. If nothing new was typed, repeat the same (old, new) and diff; if new input
+4. Resend (r2 §B, §C; timing revised in round 8): while the last instruction is unacked, send it
+   again no sooner than `max(frame slot, 110 ms, min(SRTT + 50 ms, 250 ms))` after the last send (round 1-7 moche
+   used the frame slot, which sent 1.5 to 2.8 times the stock client's datagrams while typing, see
+   `observations-round8.md`). If nothing new was typed, repeat the same (old, new) and diff; if new input
    arrived, use a fresh `new_num` and the cumulative diff from the acked state (this is
    what the server was seen doing under loss). Every copy gets a fresh wire counter and
    a fresh `frag_id` (per instruction sent, section 3). No exponential backoff.

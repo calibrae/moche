@@ -357,8 +357,9 @@ int32_t moche_session_handle_datagram(MocheSession *s, uint64_t now_ms,
                                       const uint8_t *data, size_t len);
 
 /* Queues keystrokes or pasted bytes (any length up to 16 MiB; len 0 is a
- * no-op). Run your pump afterwards: the datagram leaves after a short
- * collection delay, see moche_session_next_deadline_ms. */
+ * no-op). Run your pump afterwards: the datagram leaves at once when a frame
+ * interval has passed since the last send, else when it has (SRTT/2 + 6 ms,
+ * at least 20 ms), see moche_session_next_deadline_ms. */
 int32_t moche_session_send_keys(MocheSession *s, uint64_t now_ms,
                                 const uint8_t *data, size_t len);
 

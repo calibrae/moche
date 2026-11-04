@@ -114,8 +114,12 @@ investigated); wall time for the paste is about the same for both (0.45 s agains
   typing at the end of a line, backspace and left/right, but not insertion in the middle of
   a line, and it has only been validated on loopback with a simulated delay, not on a real
   WAN. Details and limits: [docs/predict.md](docs/predict.md).
-- Typing echo is about 10 ms slower than stock at the median (28 ms against 17 ms,
-  observations round 6): moche waits 8 ms to batch keystrokes.
+- Typing echo was about 10 ms slower than stock at the median (28 ms against 17 ms,
+  observations round 6) because moche waited 8 ms to batch keystrokes, and at a high RTT
+  it sent 1.5 to 2.6 times the stock client's datagrams while typing (re-sends at the frame
+  slot). Both are changed in round 8 (`docs/observations-round8.md`): no collection delay,
+  re-sends paced like the stock client. Validated on loopback with a delay relay only; the
+  real-network lab run is still to do.
 - Only tested against `mosh-server` 1.4.0. Other versions are unknown.
 - Only IPv4 has been tested; IPv6 may or may not work.
 - VT coverage is what the server emitted in our test scenarios (shell, `ls --color`,
