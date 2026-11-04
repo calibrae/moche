@@ -33,6 +33,16 @@ fn read_key_line<R: BufRead>(mut r: R) -> Result<String, String> {
     Ok(k.to_string())
 }
 
+/// `moche <version> (<commit>, <target triple>)`.
+fn version_string() -> String {
+    format!(
+        "moche {} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("MOCHE_GIT_COMMIT"),
+        env!("MOCHE_TARGET")
+    )
+}
+
 fn fail(code: u8, msg: &str) -> ExitCode {
     eprintln!("moche: {msg}");
     ExitCode::from(code)
@@ -46,7 +56,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(Parsed::Version) => {
-            println!("moche {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", version_string());
             return ExitCode::SUCCESS;
         }
         Err(e) => {
@@ -150,5 +160,20 @@ mod tests {
         assert_eq!(read_key_line(&b"  abc\nrest"[..]).unwrap(), "abc");
         assert!(read_key_line(&b"\n"[..]).is_err());
         assert!(read_key_line(&b""[..]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn version_string_shape() {
+        let v = super::version_string();
+        let rest = v
+            .strip_prefix(concat!("moche ", env!("CARGO_PKG_VERSION"), " ("))
+            .expect("prefix");
+        let inner = rest.strip_suffix(')').expect("suffix");
+        let (commit, target) = inner.split_once(", ").expect("commit, target");
+        assert!(!commit.is_empty() && !commit.contains(char::is_whitespace));
+        assert!(target.contains('-'), "target triple: {target}");
     }
 }

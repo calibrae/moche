@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "moche-cli"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "moche-core",
  "rustix",
@@ -200,7 +200,7 @@ dependencies = [
 
 [[package]]
 name = "moche-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "aes",
  "base64",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "moche-ffi"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "getrandom",
  "moche-core",

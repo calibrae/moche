@@ -6,3 +6,7 @@ tools/mosh-lab/.state/
 # built by tools/ios/build-xcframework.sh
 /swift/Moche.xcframework
 /swift/.build/
+
+# release artefacts and pinned build tools
+/dist/
+/target/tools/
