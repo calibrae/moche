@@ -35,18 +35,12 @@ captures against a stock server with the tools in `tools/`, and compare the code
 claims. The git history shows the order the work happened in: documents and captures
 first, code after.
 
-## AI assistance and what the process cannot rule out
+## AI assistance
 
-MAINTAINER: review wording
 The code, tests and documents of this repository were written by an AI model (Anthropic's
 Claude, driven through Claude Code), directed and reviewed by the maintainer. The model
 was instructed not to consult mosh's source code, and the process above reflects that
-instruction. The model's training data may contain GPL-licensed code, possibly including
-mosh itself or other implementations of the same protocol. That cannot be excluded or
-audited from here, and the clean-room rules constrain what was consulted during the work,
-not what the model learned before it. Whether this affects the licence status of the
-result is not something this file claims to settle. If you need certainty (for example
-for a commercial product), review the code yourself or take legal advice.
+instruction.
 
 ## Contributors
 

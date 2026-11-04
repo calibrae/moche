@@ -11,8 +11,8 @@ moche talks to a **stock `mosh-server`**: it is a client only. It is made of:
   (the iOS SSH client sigillo is the first consumer).
 
 The name is French for "ugly", a pun on mosh. moche is **not affiliated with the mosh
-project**. mosh is GPLv3; none of its code is included in, copied into or derived from
-this repository (see [docs/CLEAN_ROOM.md](docs/CLEAN_ROOM.md)).
+project**. mosh is GPLv3; no mosh code is included or copied here, and moche was written
+without consulting mosh's source (see [docs/CLEAN_ROOM.md](docs/CLEAN_ROOM.md)).
 
 ## Status
 
@@ -134,8 +134,7 @@ investigated); wall time for the paste is about the same for both (0.45 s agains
 
 The code and documents in this repository were written with the help of an AI model
 (Anthropic's Claude, through Claude Code), under the clean-room instructions in
-[docs/CLEAN_ROOM.md](docs/CLEAN_ROOM.md). That file says what this does and does not
-guarantee.
+[docs/CLEAN_ROOM.md](docs/CLEAN_ROOM.md), which describes the process.
 
 ## Licence
 
