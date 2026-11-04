@@ -38,6 +38,31 @@ names, fixed mtime, numeric owner 0, `gzip -n`): packaging the same binary twice
 Set `MOCHE_CODESIGN_IDENTITY` to a Developer ID identity to sign the macOS binary (hardened runtime);
 unset, the binary only carries the linker's ad-hoc signature.
 
+## Reproducibility
+
+Checked 2026-11-04 on a second Mac, fresh clones in different directories, pinned zig:
+
+- Linux tarballs and binaries are bit-for-bit identical across clone paths, hosts and between
+  `cargo zigbuild` and the aarch64 linker wrapper, provided the **same rustc** is used (both
+  matched hashes built on rustc 1.95.0). A different rustc changes the binary: the Linux hashes
+  built with 1.99.0 differ from the 1.95.0 ones. The commit hash and `SOURCE_DATE_EPOCH` are part
+  of the input (`GIT_COMMIT` and `SOURCE_DATE_EPOCH` can be exported to rebuild an older identity).
+  To make CI hashes stable, pin the toolchain (a `rust-toolchain.toml` at the repo root, not done yet).
+- The macOS binary is reproducible only when built in the **same absolute directory**: ld64 derives
+  `LC_UUID` from the linker inputs, including their paths (`--remap-path-prefix` does not reach the
+  linker). Two clones at different paths differ in 16 bytes of `LC_UUID` plus the code-signature
+  hashes. `-Wl,-no_uuid` removes the difference but the binary then refuses to start
+  ("missing LC_UUID load command"), so it is not an option.
+
+## aarch64 Linux link step
+
+rustc 1.99 passes `-Wl,--fix-cortex-a53-843419` when linking `aarch64-unknown-linux-musl`, and zig's
+linker rejects it ("unsupported linker arg"), so `cargo zigbuild` fails (rustc 1.95 does not pass it).
+`build.sh` therefore builds that target with plain `cargo build` and a small linker wrapper
+(`target/tools/linkwrap-<target>.sh`) that drops that flag and hands over to `cargo-zigbuild zig cc`.
+Same output as `cargo zigbuild` on a rustc that does not pass the flag (hashes verified identical).
+x86_64 still uses `cargo zigbuild` directly.
+
 ## Runner requirements
 
 - Runner label: set in one place, `runs-on:` in `.gitea/workflows/release.yaml`. Pin it to a runner whose

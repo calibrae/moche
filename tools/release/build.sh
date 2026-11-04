@@ -69,9 +69,26 @@ export CARGO_INCREMENTAL=0
 rustup target add "$T" >/dev/null
 start=$(date +%s)
 case "$T" in
-  *-linux-musl)
+  x86_64-unknown-linux-musl)
     ensure_zig; ensure_zigbuild
     cargo zigbuild --release --locked -p moche-cli --target "$T"
+    ;;
+  aarch64-unknown-linux-musl)
+    ensure_zig; ensure_zigbuild
+    # rustc >= 1.96 (seen on 1.99) passes -Wl,--fix-cortex-a53-843419 on aarch64 linux, which zig's
+    # linker rejects ("unsupported linker arg"). Link through a wrapper that drops that one flag and
+    # then hands over to cargo-zigbuild's own `zig cc` (same crt/arg handling as `cargo zigbuild`).
+    mkdir -p "$TOOLS"
+    LW="$TOOLS/linkwrap-$T.sh"
+    cat > "$LW" <<WRAP
+#!/bin/sh
+n=\$#; i=0
+while [ \$i -lt \$n ]; do a=\$1; shift; i=\$((i+1)); case "\$a" in *fix-cortex-a53-843419) ;; *) set -- "\$@" "\$a";; esac; done
+export CARGO_ZIGBUILD_ZIG_VERSION=$ZIG_VERSION
+exec cargo-zigbuild zig cc -- -g -fno-sanitize=all -target aarch64-linux-musl "\$@"
+WRAP
+    chmod 0755 "$LW"
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$LW" cargo build --release --locked -p moche-cli --target "$T"
     ;;
   aarch64-apple-darwin)
     [ "$(uname -s)-$(uname -m)" = "Darwin-arm64" ] || { echo "$T must be built on a macOS arm64 host" >&2; exit 1; }

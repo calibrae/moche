@@ -68,8 +68,16 @@ class Sampler:
         except OSError:
             pass
         kb = lambda k: int(st[k].split()[0]) if k in st else None
+        cpu_ns = None
+        try:  # sum_exec_runtime in ns, summed over threads; no tick quantisation (needs CONFIG_SCHED_INFO)
+            cpu_ns = 0
+            for t in os.listdir(base + "/task"):
+                with open("%s/task/%s/schedstat" % (base, t)) as f:
+                    cpu_ns += int(f.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            cpu_ns = None
         d = {
-            "t": time.time(),
+            "t": time.time(), "cpu_ns": cpu_ns,
             "cpu_user_s": utime / self.hz, "cpu_sys_s": stime / self.hz,
             "rss_kb": kb("VmRSS"), "peak_rss_kb": kb("VmHWM"), "vsz_kb": kb("VmSize"),
             "threads": nthr, "vol_cs": vol, "invol_cs": invol,
@@ -308,7 +316,7 @@ class Run:
         if first is None:
             raise RuntimeError("no paint within 30 s")
         time.sleep(1.0)  # let the connection settle; its CPU is part of the window
-        zero = {"t": self.t0, "cpu_user_s": 0.0, "cpu_sys_s": 0.0}
+        zero = {"t": self.t0, "cpu_user_s": 0.0, "cpu_sys_s": 0.0, "cpu_ns": 0 if IS_LINUX else None}
         return zero, self.snap(True), {"first_paint_s": first}
 
     def sc_idle(self, srv):
@@ -420,6 +428,11 @@ def window_metrics(w0, w1, samples):
          "cpu_sys_s": w1["cpu_sys_s"] - w0["cpu_sys_s"],
          "cpu_s": cpu(w1) - cpu(w0),
          "cpu_pct_of_core": 100.0 * (cpu(w1) - cpu(w0)) / wall if wall > 0 else None}
+    if w1.get("cpu_ns") is not None and w0.get("cpu_ns") is not None:
+        # Linux: exact on-CPU time replaces the 10 ms-tick user+sys sum (the user/sys split stays tick-based)
+        d["cpu_s_ticks"] = d["cpu_s"]
+        d["cpu_s"] = (w1["cpu_ns"] - w0["cpu_ns"]) / 1e9
+        d["cpu_pct_of_core"] = 100.0 * d["cpu_s"] / wall if wall > 0 else None
     inwin = [s for s in samples + [w1] if w0["t"] <= s["t"] <= w1["t"] + 1e-6]
     rss = [s["rss_kb"] for s in samples + [w1] if s.get("rss_kb")]
     d["final_rss_kb"] = w1.get("rss_kb")
@@ -510,6 +523,11 @@ def environment(a, moche, stock, lang):
             for l in sh(["lscpu"]).splitlines():
                 if l.startswith("Model name"):
                     model = l.split(":", 1)[1].strip()
+        if model in ("", "-"):
+            model = ""
+            for l in sh(["lscpu"]).splitlines():
+                if l.startswith("Vendor ID"):
+                    model = l.split(":", 1)[1].strip() + " (VM guest, model name not exposed)"
         e["cpu_model"] = model or "unknown"
         try:
             with open("/proc/meminfo") as f:

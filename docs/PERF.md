@@ -130,9 +130,9 @@ result directories.
 
 Linux specifics that differ from macOS: PSS and exact `VmHWM` peak are available, context
 switches are split voluntary/involuntary, but there is no wakeup counter or
-instructions/cycles, and the footprint columns stay empty. The Linux code paths were checked
-by reading and `bash -n`/`py_compile` only, not executed on this Mac; if a column is empty
-on the first Linux run, look at `runs/*.json` for the raw samples first.
+instructions/cycles, and the footprint columns stay empty. The Linux code paths first ran on 2026-11-04 (see the Linux section; two small fixes were needed:
+schedstat for exact CPU time and an lscpu fallback for the CPU model); on a new platform, if a column is
+empty, look at `runs/*.json` for the raw samples first.
 
 ## macOS arm64
 
@@ -183,11 +183,12 @@ nothing), 2 dynamic libs (`libSystem`, `libiconv`), `__TEXT` 480 KB. Stock mosh-
   system time: 0.072 vs 0.039 s), still 0.4 % of a core. Context switches and wakeups per
   second are equal (about 46/s and 13/s, which is the 10 keystrokes/s plus replies). moche
   sent 413 datagrams for 300 keystrokes, more than one per key: worth a look if battery
-  matters on the phone (it is the only place moche is not better or equal).
+  matters on the phone (it is the only place moche is not better or equal). Checked on Linux with
+  tcpdump: stock sends exactly the same number of datagrams, so it is not an excess (see the Linux section).
 - **Startup**: first paint in 0.17 s versus 0.34 s; 8 ms versus 44 ms of CPU. One moche
   run took 0.94 s to first paint (min-max 0.15-0.94): an outlier, probably the first server
-  frame lost or delayed, not reproduced in the other 2 runs; check on Linux before
-  concluding.
+  frame lost or delayed, not reproduced in the other 2 runs, nor in 20 runs per client on Linux
+  (max 0.137 s; see the Linux section).
 - **Surprises**: none against the design. The bulk scenarios (flood, steady) are
   dominated by wall-clock noise on loopback (moche `steady` min 0.25 s, median 1.19 s: the
   state it sees depends on frame pacing, not on its own cost); their CPU is a few ms, not
@@ -418,5 +419,260 @@ nothing), 2 dynamic libs (`libSystem`, `libiconv`), `__TEXT` 480 KB. Stock mosh-
 
 ## Linux aarch64 (lab VM)
 
-_Not run yet. Run the commands in "Linux run in the VM lab" above, then paste the medians
-table and the generated `report.md` here._
+Measured 2026-11-04, `linux-aarch64-vm`: client VM `moche-b` (Ubuntu 24.04, kernel 6.8, 2 vCPU of an
+Apple host under Virtualization.framework, 2 GiB RAM, tmux 3.4, python 3.12), server VM `moche-a`
+(Debian 13, stock mosh-server 1.4.0) over the VM-to-VM user-v2 network (a real virtual network, RTT
+about 1.5 ms: not loopback). moche 0.1.0 (commit b26ebe8) is the release artefact
+`moche-0.1.0-aarch64-unknown-linux-musl` built on a second Mac with `tools/release/` (static, no
+shared libraries); baseline is the distro `mosh-client` 1.4.0 (dynamic, glibc). Tool run:
+`--server-ssh` (fresh server per run), 3 repetitions, idle 60 s, typing 30 s. All 42 runs passed
+(paste sha256 matched every time). The CPU figures on Linux come from `/proc/<pid>/schedstat`
+(exact on-CPU nanoseconds); the user/sys split below it still comes from 10 ms ticks and is coarse.
+
+### Medians, moche vs stock mosh-client (Linux VM) and the macOS figures
+
+| scenario | metric | moche (Linux) | stock (Linux) | ratio Linux | ratio macOS |
+|---|---|---:|---:|---:|---:|
+| startup | launch to first paint (s) | 0.122 | 0.269 | 0.45 | 0.49 |
+| startup | CPU (s) | 0.003 | 0.004 | 0.70 | 0.19 |
+| idle 60 s | CPU (s) / % of a core | 0.027 / 0.05 | 0.009 / 0.02 | 3.0 | 1.4 |
+| idle 60 s | peak RSS (VmHWM) / PSS (MB) | 1.1 / 0.9 | 13.9 / 9.8 | 0.08 / 0.09 | 0.17 / 0.22 (footprint) |
+| idle 60 s | voluntary ctx switches /s | 0.7 | 0.6 | 1.1 | 1.6 |
+| idle 60 s | traffic (moche) | 24 datagrams out, 1.7 KB each way | | | 26 out |
+| typing 30 s | CPU (s) / % of a core | 0.494 / 1.57 | 0.184 / 0.58 | 2.7 | 1.4 |
+| typing 30 s | minor page faults | 58 325 | 1 426 | 41 | 2.1 |
+| typing 30 s | peak RSS / PSS (MB) | 1.4 / 1.1 | 14.0 / 9.9 | 0.10 / 0.11 | 0.21 / 0.25 |
+| typing 30 s | datagrams for 300 keys | 306 out, 604 in | (same on the wire, see below) | | 413 out, 638 in |
+| paste 1 MiB | wall (s) | 0.46 | 0.40 | 1.15 | 1.15 |
+| paste 1 MiB | CPU (s) | 0.037 | 0.207 | 0.18 | 0.15 |
+| paste 1 MiB | peak RSS / PSS (MB) | 3.5 / 3.2 | 182.6 (max 241.9) / 178.6 | 0.02 | 0.02 (stock 199, max 732) |
+| flood 5 MB | wall (s) / CPU (s) | 0.74 / 0.004 | 0.70 / 0.002 | | 1.67 / 0.002 |
+| colors 200x60 | CPU (s) | 0.004 | 0.008 | 0.45 | 0.45 |
+| colors 200x60 | peak RSS / PSS (MB) | 3.0 / 2.7 | 15.7 / 11.7 | 0.19 / 0.23 | 0.36 / 0.57 |
+| steady `seq` | wall (s) / CPU (s) | 0.13 / 0.002 | 0.18 / 0.002 | 0.69 | 4.6 |
+
+Static: moche 0.63 MB on disk (stripped by the build), `ldd`: not a dynamic executable (no PT_INTERP,
+no DT_NEEDED; also runs under `env -i`, from an empty directory and inside a chroot holding only the
+binary), segments text 613 KB, data 17 KB, bss 42 KB. Stock mosh-client 0.33 MB but 9 shared libraries
+(libtinfo, libprotobuf, libcrypto, libz, libstdc++, libm, libgcc_s, libc, ld.so).
+
+### Reading
+
+- **Memory is 10x smaller**: 1.1 MB peak RSS (0.9 MB PSS) at idle against 13.9 MB (9.8 PSS); after the
+  heaviest scenario moche is at 3.5 MB, stock at 15.7 MB (183 MB in paste). Exact `VmHWM` peaks, so
+  the Linux ratios (0.08-0.10) are tighter than the sampled macOS ones.
+- **Paste behaves the same on Linux**: the stock client balloons to 177-242 MB RSS for a 1 MiB paste
+  (median 183 MB, macOS 199 MB) and spends 5.6x the CPU of moche (0.21 s against 0.04 s); moche stays at
+  3.5 MB (838 KB sent in 683 datagrams). Wall time is on par (0.46 s against 0.40 s, stock min 0.26 s).
+  So the stock-client balloon is not a macOS artefact.
+- **Idle is the first place moche is clearly worse**: 27 ms of CPU in 60 s (0.05 % of a core) against
+  9 ms (0.02 %), 3x, but still nothing in absolute terms, 0.7 wakeups per second like stock, one
+  heartbeat datagram every 2.5 s each way, one thread. The extra CPU is the allocator churn below:
+  2 840 minor page faults in the window against 362 for stock (24 heartbeats, about 120 faults each).
+- **Typing costs 2.7x the stock CPU on Linux, not 1.4x** (0.49 s against 0.18 s over 30 s, 1.6 % against
+  0.6 % of a core; sys time is 0.31 s against 0.08 s). Same wakeup rate as stock (39 against 44
+  context switches per second). Cause found (below): the page-fault and mmap churn of the static musl
+  allocator. On macOS (system malloc) the same code costs 1.4x.
+- **Typing datagram count is not an excess.** `tcpdump` on the client VM, 100 keystrokes at 10/s, same
+  server, both clients: moche 101 client-to-server and 200 server-to-client datagrams, stock 101 and 200,
+  sizes 65-87 B against 67-85 B. Pattern per key, identical for both: the keystroke datagram goes out
+  after the 8 ms collect delay, the server answers with the echo frame about 12 ms after the key and a
+  second frame about 50 ms after the first; the client's acknowledgement rides on the next keystroke
+  datagram 100 ms later, so there is no standalone ack. In the full run moche sent 306 datagrams for 300
+  keys (1.02 per key), not the 413 seen on macOS. Not acks, not resends, not heartbeats, not the 8 ms
+  delay: the macOS 1.38 per key was most likely an artefact of the 100 ms key interval racing the ack
+  delay timer on loopback (standalone acks when a key arrives a few ms late); stock was not counted on
+  macOS, so that part stays a hypothesis.
+- **Why typing and idle burn more CPU: allocator churn.** `strace -c` on the moche pid during 100
+  keystrokes: 1 406 `mmap` and 1 406 `munmap` (about 14 pairs per keystroke), 401 `ppoll`, 400
+  `recvfrom` (half EAGAIN), 101 `sendto`; stock: no `mmap` at all (404 `brk`), 464 `pselect6`. A
+  `strace -e mmap,munmap` trace around single keystrokes shows 6 anonymous mappings of 69 632, 86 016,
+  36 864, 69 632, 69 632 and 36 864 bytes created and freed on every outgoing datagram, and 2-3 more of
+  36-65 KB around each received datagram: whole-screen-sized buffers (an 80x24 grid is 1 920 cells)
+  allocated and dropped per event. musl's allocator maps and unmaps blocks of that size every time,
+  where glibc and the macOS libc keep them in the heap; the result is a page fault per 4 KB touched
+  (58 k faults in typing, 41x stock) and all the extra sys time. Fix directions for the core (not done
+  here, `crates/**` untouched): reuse the frame and diff buffers across events (or avoid cloning full
+  snapshots when sending a keystroke), or link a MIT/Apache global allocator in the musl builds. Not a
+  correctness problem and not visible at the user's level (1.6 % of one core while typing), but it is the
+  one thing in the table where moche is worse, and it costs battery on a phone.
+- **Startup**: first paint at 0.122 s against 0.269 s, 3 ms against 4 ms of CPU. See the distribution
+  below; nothing like the macOS outlier.
+- Linux-vs-macOS differences that matter when comparing: the real (virtual) network instead of loopback
+  (about 1.5 ms RTT, the server answers the first datagram in 1.3-2 ms); a glibc stock client and a
+  musl moche instead of two system-libc binaries; 10 ms scheduler-tick CPU on Linux (replaced by
+  schedstat in the totals); exact `VmHWM` and PSS instead of sampled RSS and `phys_footprint`; no
+  wakeup, instruction or cycle counters. Bulk scenarios are shorter still (0.1-0.7 s windows).
+
+### Startup distribution, 20 runs per client (Linux VM, no loss)
+
+| client | min | median | p90 | max |
+|---|---:|---:|---:|---:|
+| moche | 0.119 s | 0.128 s | 0.131 s | 0.137 s |
+| stock | 0.261 s | 0.274 s | 0.278 s | 0.280 s |
+
+No outlier in 40 runs: the spread is 18 ms for moche. The macOS run in which moche needed 0.94 s
+(against 0.15 s) was therefore not reproduced; `tcpdump` of all 40 flows shows the server answering the
+first client datagram in 1.3-2.0 ms every time and no client datagram repeated within the first second,
+so the transport's 1 s initial SRTT does not stall a normal connection setup. Whether the macOS outlier
+was a lost or late first frame or a slow first shell prompt on the server is not provable from that run.
+
+Extra experiment, a loss test, 20 runs per client with 25 % random loss of client-to-server UDP applied
+by `iptables` on the client VM (`tools/perf` unchanged): moche first paint min 0.118, median 0.132,
+max 0.634 s; 5 of 20 runs at 0.27-0.29 s, 2 at 0.53 s, 2 at 0.63 s, 11 at 0.12-0.13 s. Never close to
+1 s, so a lost opening datagram costs 150-500 ms (the recovery comes from the ack and heartbeat timers,
+not from the 1 s SRTT-based resend), which would explain an occasional slow start on a lossy path. The
+stock client showed no run above 0.28 s in the same test (its first paint is not tied to its own first
+datagram), so it is less sensitive to this loss pattern. `tcpdump` on the sender does not see packets
+dropped by the netfilter output chain, so the exact timing of the dropped datagram was not captured;
+the flow-by-flow attribution to a client was ambiguous and is not claimed. Worth re-running on the
+phone's real path before drawing a conclusion.
+
+### Tool fixes made for this run
+
+- `perf.py`: Linux CPU totals now come from `/proc/<pid>/schedstat` (the 10 ms tick showed 0.000 for idle
+  and startup); the CPU model falls back to lscpu `Vendor ID` when the VM reports `-`. Everything else
+  in the Linux code paths worked on the first run (PSS, VmHWM, context switches, ssh server mode).
+- The Linux branches of `measure.sh` and `perf.py` ran for the first time here and needed nothing else.
+  `measure.sh` takes `--ssh-opt VALUE` (not `--ssh-opt=VALUE`).
+
+### Full generated report (host `linux-aarch64-vm`)
+
+#### Host `linux-aarch64-vm`
+
+| | |
+|---|---|
+| label | linux-aarch64-vm |
+| OS | Ubuntu 24.04.5 LTS (Linux 6.8.0-147-generic) |
+| CPU | Apple (VM guest, model name not exposed), 2 cores |
+| RAM | 1.9 GiB |
+| moche | moche 0.1.0 (b26ebe8, aarch64-unknown-linux-musl) |
+| mosh-client (baseline) | mosh-client (mosh 1.4.0) [build mosh 1.4.0] |
+| mosh-server | mosh-server (mosh 1.4.0) [build mosh 1.4.0] (ssh) |
+| tmux / python | tmux 3.4 / 3.12.3 |
+| locale | en_US.UTF-8 |
+| date (UTC) | 2026-11-04T12:17:35Z |
+
+##### Static facts
+
+| binary | size MB (as built) | stripped MB | dynamic deps | file |
+|---|---:|---:|---:|---:|
+| moche | 0.63 | 0.63 | 1 | ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped |
+| mosh-client | 0.33 | 0.33 | 10 | ELF 64-bit LSB pie executable, ARM aarch64, dynamically linked, stripped |
+
+(`moche`: "not a dynamic executable"; the "1" is that line. `mosh-client` links libtinfo, libprotobuf,
+libcrypto, libz, libstdc++, libm, libgcc_s, libc and the loader.)
+
+##### Startup (launch to first paint, +1 s settle)
+
+| metric | moche median (n=3) | moche min-max | stock median (n=3) | stock min-max | moche / stock |
+|---|---:|---:|---:|---:|---:|
+| launch to first paint (s) | 0.122 | 0.119-0.130 | 0.269 | 0.263-0.274 | 0.45 |
+| wall time (s) | 1.13 | 1.12-1.13 | 1.27 | 1.26-1.28 | 0.89 |
+| CPU time user+sys (s) | 0.003 | 0.002-0.003 | 0.004 | 0.004-0.004 | 0.70 |
+| CPU, % of one core | 0.23 | 0.18-0.28 | 0.29 | 0.29-0.33 | 0.80 |
+| peak RSS (MB) | 1.2 | 1.0-1.2 | 13.6 | 13.6-13.6 | 0.09 |
+| final RSS (MB) | 0.9 | 0.9-0.9 | 13.6 | 13.6-13.6 | 0.07 |
+| PSS (MB, Linux) | 0.9 | 0.9-0.9 | 9.6 | 8.9-9.6 | 0.09 |
+| threads (final) | 1 | 1-1 | 1 | 1-1 | 1.00 |
+| open fds (final) | 9 | 9-9 | 5 | 5-5 | 1.80 |
+| bytes sent / received (moche --stats) | 217 / 160 | 211-217 / 155-161 | - | - | - |
+| datagrams sent / received | 3 / 2 | 3-3 / 2-2 | - | - | - |
+
+##### Idle (heartbeats only)
+
+| metric | moche median (n=3) | moche min-max | stock median (n=3) | stock min-max | moche / stock |
+|---|---:|---:|---:|---:|---:|
+| wall time (s) | 60.01 | 60.01-60.01 | 60.01 | 60.00-60.01 | 1.00 |
+| CPU time user+sys (s) | 0.027 | 0.026-0.032 | 0.009 | 0.009-0.011 | 3.01 |
+| CPU, % of one core | 0.05 | 0.04-0.05 | 0.02 | 0.02-0.02 | 3.01 |
+| peak RSS (MB) | 1.1 | 1.1-1.2 | 13.9 | 13.9-13.9 | 0.08 |
+| final RSS (MB) | 0.9 | 0.9-0.9 | 13.9 | 13.9-13.9 | 0.06 |
+| PSS (MB, Linux) | 0.9 | 0.9-0.9 | 9.8 | 9.1-9.8 | 0.09 |
+| threads (final) | 1 | 1-1 | 1 | 1-1 | 1.00 |
+| voluntary ctx switches /s | 0.7 | 0.6-0.7 | 0.6 | 0.5-0.6 | 1.14 |
+| involuntary ctx switches /s | 0.0 | 0.0-0.0 | 0.0 | 0.0-0.0 | - |
+| minor page faults (window) | 2840 | 2788-2840 | 362 | 362-375 | 7.85 |
+| major page faults (window) | 0 | 0-0 | 0 | 0-0 | - |
+| open fds (final) | 9 | 9-9 | 5 | 5-5 | 1.80 |
+| bytes sent / received (moche --stats) | 1686 / 1645 | 1678-1688 / 1635-1649 | - | - | - |
+| datagrams sent / received | 24 / 23 | 24-24 / 23-23 | - | - | - |
+
+##### Typing (~10 chars/s)
+
+| metric | moche median (n=3) | moche min-max | stock median (n=3) | stock min-max | moche / stock |
+|---|---:|---:|---:|---:|---:|
+| wall time (s) | 31.51 | 31.51-31.51 | 31.51 | 31.51-31.52 | 1.00 |
+| CPU time user+sys (s) | 0.494 | 0.478-0.501 | 0.184 | 0.171-0.197 | 2.68 |
+|   user (s, 10 ms ticks) | 0.180 | 0.150-0.190 | 0.090 | 0.090-0.100 | 2.00 |
+|   sys (s, 10 ms ticks) | 0.310 | 0.300-0.330 | 0.080 | 0.080-0.090 | 3.88 |
+| CPU, % of one core | 1.57 | 1.52-1.59 | 0.58 | 0.54-0.62 | 2.68 |
+| peak RSS (MB) | 1.4 | 1.4-1.4 | 14.0 | 14.0-14.0 | 0.10 |
+| final RSS (MB) | 1.1 | 1.1-1.1 | 14.0 | 14.0-14.0 | 0.08 |
+| PSS (MB, Linux) | 1.1 | 1.1-1.1 | 9.9 | 9.9-9.9 | 0.11 |
+| threads (final) | 1 | 1-1 | 1 | 1-1 | 1.00 |
+| voluntary ctx switches /s | 38.9 | 38.8-39.2 | 43.7 | 43.2-44.6 | 0.89 |
+| involuntary ctx switches /s | 0.2 | 0.1-0.3 | 0.1 | 0.1-0.3 | 1.50 |
+| minor page faults (window) | 58325 | 58322-58412 | 1426 | 1425-1426 | 40.90 |
+| major page faults (window) | 0 | 0-0 | 0 | 0-0 | - |
+| open fds (final) | 9 | 9-9 | 5 | 5-5 | 1.80 |
+| bytes sent / received (moche --stats) | 24161 / 49473 | 24126-24229 / 49422-49495 | - | - | - |
+| datagrams sent / received | 306 / 604 | 306-307 / 604-604 | - | - | - |
+
+##### Paste (1 MiB base64 into cat > file, sha256 checked)
+
+| metric | moche median (n=3) | moche min-max | stock median (n=3) | stock min-max | moche / stock |
+|---|---:|---:|---:|---:|---:|
+| paste to sha-verified (s) | 0.46 | 0.45-0.46 | 0.40 | 0.26-0.54 | 1.15 |
+| CPU time user+sys (s) | 0.037 | 0.034-0.037 | 0.207 | 0.150-0.228 | 0.18 |
+| CPU, % of one core | 8.08 | 7.42-8.16 | 52.12 | 42.34-57.69 | 0.16 |
+| peak RSS (MB) | 3.5 | 3.4-3.5 | 182.6 | 177.4-241.9 | 0.02 |
+| final RSS (MB) | 3.2 | 3.1-3.2 | 182.6 | 177.4-241.9 | 0.02 |
+| PSS (MB, Linux) | 3.2 | 3.1-3.2 | 178.6 | 173.3-237.9 | 0.02 |
+| threads (final) | 1 | 1-1 | 1 | 1-1 | 1.00 |
+| voluntary ctx switches /s | 170.1 | 124.7-323.5 | 81.7 | 62.8-111.2 | 2.08 |
+| involuntary ctx switches /s | 187.1 | 159.3-238.2 | 280.0 | 178.2-339.3 | 0.67 |
+| minor page faults (window) | 4917 | 4852-4918 | 44346 | 42782-59962 | 0.11 |
+| major page faults (window) | 0 | 0-0 | 0 | 0-0 | - |
+| bytes sent / received (moche --stats) | 838422 / 34475 | 838270-838691 / 33335-34682 | - | - | - |
+| datagrams sent / received | 683 / 46 | 683-687 / 45-46 | - | - | - |
+
+##### Flood (yes | head -c 5000000)
+
+| metric | moche median (n=3) | moche min-max | stock median (n=3) | stock min-max | moche / stock |
+|---|---:|---:|---:|---:|---:|
+| wall time (s) | 0.74 | 0.67-0.75 | 0.70 | 0.69-0.72 | 1.05 |
+| CPU time user+sys (s) | 0.004 | 0.003-0.005 | 0.002 | 0.002-0.003 | 1.49 |
+| CPU, % of one core | 0.54 | 0.46-0.64 | 0.33 | 0.28-0.36 | 1.61 |
+| peak RSS (MB) | 1.4 | 1.4-1.4 | 14.4 | 14.4-14.4 | 0.10 |
+| PSS (MB, Linux) | 0.9 | 0.9-1.1 | 10.3 | 10.3-10.3 | 0.09 |
+| minor page faults (window) | 1634 | 1440-1840 | 207 | 166-248 | 7.89 |
+| datagrams sent / received | 9 / 23 | 9-10 / 21-27 | - | - | - |
+
+##### 256-colour dump (200x60 pane, 5 passes)
+
+| metric | moche median (n=3) | moche min-max | stock median (n=3) | stock min-max | moche / stock |
+|---|---:|---:|---:|---:|---:|
+| wall time (s) | 0.13 | 0.12-0.13 | 0.13 | 0.13-0.14 | 0.97 |
+| CPU time user+sys (s) | 0.004 | 0.004-0.005 | 0.008 | 0.008-0.008 | 0.45 |
+| CPU, % of one core | 2.96 | 2.89-3.75 | 6.19 | 6.18-6.48 | 0.48 |
+| peak RSS (MB) | 3.0 | 2.9-3.4 | 15.7 | 15.7-15.9 | 0.19 |
+| PSS (MB, Linux) | 2.7 | 2.6-3.0 | 11.7 | 11.6-11.8 | 0.23 |
+| minor page faults (window) | 995 | 915-1232 | 262 | 245-303 | 3.80 |
+| datagrams sent / received | 5 / 10 | 5-5 / 10-12 | - | - | - |
+
+##### Steady output (seq 1 200000)
+
+| metric | moche median (n=3) | moche min-max | stock median (n=3) | stock min-max | moche / stock |
+|---|---:|---:|---:|---:|---:|
+| wall time (s) | 0.13 | 0.12-0.13 | 0.18 | 0.18-0.19 | 0.69 |
+| CPU time user+sys (s) | 0.002 | 0.001-0.002 | 0.002 | 0.002-0.002 | 0.67 |
+| CPU, % of one core | 1.24 | 1.07-1.27 | 1.33 | 1.18-1.34 | 0.94 |
+| peak RSS (MB) | 1.3 | 1.2-1.4 | 14.5 | 14.4-14.8 | 0.09 |
+| PSS (MB, Linux) | 1.2 | 1.1-1.2 | 10.0 | 10.0-10.7 | 0.12 |
+| minor page faults (window) | 492 | 350-492 | 212 | 187-277 | 2.32 |
+| datagrams sent / received | 5 / 8 | 5-6 / 7-8 | - | - | - |
+
+(Condensed from the generated `report.md`: rows that were identical in both clients, the all-zero
+user/sys tick rows of the short scenarios and the dynamic-library address listing are omitted; the raw
+`runs/*.json` and the full report stay in the VM lab output directory.)
