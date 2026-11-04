@@ -33,9 +33,9 @@ pub const ADAPTIVE_ON_MS: f64 = 30.0;
 /// Smoothed RTT (ms) below which Adaptive mode stops (hysteresis).
 pub const ADAPTIVE_OFF_MS: f64 = 20.0;
 /// Smoothed RTT (ms) above which unconfirmed predictions are underlined.
-pub const FLAG_ON_MS: f64 = 85.0;
+pub const FLAG_ON_MS: f64 = 100.0;
 /// Smoothed RTT (ms) below which the underline is dropped (hysteresis).
-pub const FLAG_OFF_MS: f64 = 65.0;
+pub const FLAG_OFF_MS: f64 = 80.0;
 /// Confirmed predictions needed to trust the connection again after a
 /// contradiction.
 pub const CONFIRM_STREAK: u32 = 2;
