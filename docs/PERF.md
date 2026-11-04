@@ -789,3 +789,80 @@ strace -f -c -p $(pgrep -x moche) -e trace=mmap,munmap,brk,mprotect   # type 100
 
 Compare typing CPU (was 0.494 s), minor page faults (58 325) and idle CPU (0.027 s) with the
 numbers in the Linux section; a good result is typing near 0.2 s and a few thousand faults.
+
+### Linux A/B, same VM, same day
+
+Measured 2026-11-04 in the lab VM, 3 repetitions per cell, typing 30 s, idle 60 s, paste 1 MiB,
+startup; medians, with min-max in brackets for the cells that matter. Two release artefacts built
+with `tools/release/build.sh aarch64-unknown-linux-musl` (rustc 1.99.0, pinned zig 0.17.1) from fresh
+clones: baseline `61b6da1` (`moche 0.1.0 (61b6da1, aarch64-unknown-linux-musl)`, 631 680 B) and new
+`bf5951d` (`moche 0.1.0 (bf5951d, aarch64-unknown-linux-musl)`, 631 392 B). Client VM `moche-b`
+(2 vCPU, 2 GiB), server VM `moche-a` (stock mosh-server 1.4.0) over the VM-to-VM network, fresh server
+per run, `tools/perf/measure.sh --server-ssh` once per moche binary (label `linux-aarch64-vm-ab-base`
+and `-new`, scenarios typing,idle,paste,startup). The stock `mosh-client` 1.4.0 is measured in both
+runs, so it appears twice: the two stock columns are the same binary a few minutes apart, i.e. the
+run-to-run noise of the lab. All 48 runs passed (paste sha256 matched every time). The baseline column
+reproduces the earlier Linux section (typing 0.44-0.50 s, 58 k faults), so the lab did not drift.
+
+| scenario | metric | moche baseline `61b6da1` | moche new `bf5951d` | stock (run 1) | stock (run 2) |
+|---|---|---:|---:|---:|---:|
+| typing 30 s | CPU total (s) | 0.442 [0.413-0.497] | **0.155 [0.144-0.167]** | 0.173 [0.166-0.196] | 0.219 [0.192-0.252] |
+| typing 30 s | CPU user / sys (s, 10 ms ticks) | 0.16 / 0.27 | 0.08 / 0.07 | 0.09 / 0.08 | 0.10 / 0.10 |
+| typing 30 s | minor / major page faults | 58 324 / 0 | **32 / 0** | 1 426 / 0 | 1 425 / 0 |
+| typing 30 s | peak RSS / PSS (MB) | 1.4 / 1.1 | 1.3 / 1.3 | 14.0 / 9.9 | 14.0 / 9.9 |
+| typing 30 s | voluntary ctx switches /s | 38.8 | 38.6 | 43.4 | 43.7 |
+| typing 30 s | datagrams out / in (300 keys) | 306-307 / 604 | 306 / 604 | | |
+| idle 60 s | CPU total (s) | 0.023 [0.022-0.028] | **0.007 [0.006-0.008]** | 0.009 | 0.010 |
+| idle 60 s | minor faults | 2 840 | **0** | 370 | 362 |
+| idle 60 s | peak RSS / PSS (MB) | 1.2 / 0.9 | 1.2 / 1.2 | 13.9 / 9.8 | 13.9 / 9.8 |
+| idle 60 s | voluntary ctx switches /s | 0.7 | 0.7 | 0.5 | 0.6 |
+| paste 1 MiB | wall (s) | 0.462 | 0.452 | 0.509 | 0.420 |
+| paste 1 MiB | CPU total (s) | 0.034 | 0.035 | 0.243 | 0.204 |
+| paste 1 MiB | minor faults | 4 848 | 2 088 | 45 033 | 53 025 |
+| paste 1 MiB | peak RSS (MB) | 3.5 | 3.7 | 185 | 215 |
+| startup | launch to first paint (s) | 0.121 | 0.129 | 0.269 | 0.274 |
+| startup | CPU total (s) | 0.002 | 0.002 | 0.004 | 0.004 |
+
+`strace -f -c -p <pid> -e trace=mmap,munmap,brk,mprotect` over 100 typed keys at 10/s (one session per
+binary, same server):
+
+| client | mmap | munmap | brk | mprotect | per key |
+|---|---:|---:|---:|---:|---|
+| moche baseline | 1 412 | 1 412 | 0 | 0 | 14.1 mmap + 14.1 munmap |
+| moche new | **1** | 0 | 0 | 0 | 0.01 mmap |
+| stock | 0 | 0 | 477 | 0 | 4.8 brk (heap grow/shrink, no mmap) |
+
+A second short `strace -f -tt -e trace=mmap,munmap,brk` around 5 keys at 0.5 s spacing shows 2 lines for
+the new build in total (one `munmap` and one `mmap`, both 98 304 B, 0.6 s apart: a single 96 KiB
+buffer freed and re-created, not per key; I did not identify it and it is not worth chasing), against the
+stock client's `brk` 4-step grow/shrink on every key.
+
+#### Interpretation
+
+- **The allocator churn is gone and the CPU followed.** Typing CPU fell from 0.44 s to 0.155 s (-65 %),
+  sys time from 0.27 s to 0.07 s, minor faults from 58 324 to 32 (the whole 30 s window), mmap/munmap
+  from 14 pairs per key to none. Idle CPU fell from 23 ms to 7 ms in 60 s and idle faults from 2 840 to
+  0. That is the musl mmap/munmap + page-fault cost the earlier section pinned on whole-screen-sized
+  buffers, removed by reusing the zlib state and the recycled grids.
+- **moche is now at or below stock on every CPU line on Linux.** Typing 0.155 s against 0.173 s and
+  0.219 s (ratio 0.7-0.9, was 2.7), idle 7 ms against 9-10 ms, paste 0.035 s against 0.20-0.24 s (the
+  0.15x of before is unchanged), startup 2 ms against 4 ms. It also makes 11 % fewer wakeups than
+  stock in typing (38.6 against 43.5 per second) and 45x fewer minor faults (32 against 1 425).
+  Datagram counts are identical to the baseline (306 out, 604 in), so the change is wire-neutral here
+  too.
+- **Paste** is unchanged in CPU and wall time (it is bound by VT scrolling and zlib, not by the
+  allocator); its page faults halved (4 848 to 2 088, peak RSS 3.5 to 3.7 MB).
+- **Startup** first paint 0.129 s against 0.121 s is inside the 18 ms spread seen in the 20-run
+  distribution of the earlier section (0.119-0.137 s); not a regression.
+- **PSS went up while RSS stayed flat** (typing 1.1 to 1.3 MB, idle 0.9 to 1.2 MB): the baseline
+  returned its big blocks to the kernel after each event, the new build keeps the recycled grids and the
+  compressor state resident. It is 0.2-0.3 MB, against 9.8 MB for stock.
+- **Remaining gap: none worth a project.** What is left per key is about 0.5 ms of CPU for ~39 wakeups
+  per second (poll, recv, send, tty write) set by the protocol timing, not by allocation; sys time is
+  now the same as stock's. Further CPU work on Linux would mean row-indirection scrolling for bulk output
+  (paste is already 0.15-0.17x stock) or a smaller zlib reset cost, with gains of a few ms per session.
+  I would stop here and spend effort elsewhere. The musl-allocator proposal (3 above) is moot.
+- Setup note: `measure.sh --server-ssh` from the client VM needs a key the server VM trusts; the lab
+  had none (the earlier run's key had been removed), so a throwaway ed25519 key was generated in
+  `moche-b` and authorised in `moche-a`, passed with `--ssh-opt -i --ssh-opt KEY --ssh-opt -o --ssh-opt IdentitiesOnly=yes
+  --ssh-opt -o --ssh-opt StrictHostKeyChecking=no`, and removed at the end. No change to `tools/` was needed.
