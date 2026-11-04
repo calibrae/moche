@@ -10,3 +10,7 @@ tools/mosh-lab/.state/
 # release artefacts and pinned build tools
 /dist/
 /target/tools/
+
+# tools/perf results and private build dir
+/tools/perf/out/
+/target/perf/
