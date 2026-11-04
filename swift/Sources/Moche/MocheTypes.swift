@@ -34,6 +34,40 @@ public struct MocheStats: Sendable, Equatable {
     public init() {}
 }
 
+/// When predictive local echo is shown (`MocheSession.setPredictMode(_:)`).
+///
+/// Display only: the prediction is drawn by `takePaint()` and never changes what is sent.
+public enum PredictMode: Int32, Sendable {
+    /// Nothing is predicted. The default of every new session.
+    case never = 0
+    /// Predict while the smoothed round-trip time is above about 30 ms (until it drops
+    /// below 20 ms), and only once the server's real echo has confirmed a prediction of
+    /// the current epoch. Nothing typed at a prompt that does not echo (a password) is shown.
+    case adaptive = 1
+    /// Predict at any round-trip time and show the first prediction of an epoch before any
+    /// confirmation. **A secret typed where nothing echoes is visible for about one round
+    /// trip plus 50 ms** before it is erased: do not offer this to users typing passwords.
+    case always = 2
+}
+
+/// Predictive echo counters and state, from `MocheSession.predictStats()`.
+public struct MochePredictStats: Sendable, Equatable {
+    /// Typed keys turned into predictions (shown or hidden), cumulative.
+    public var predictions: UInt32 = 0
+    /// Predictions the server's echo confirmed, cumulative.
+    public var confirmed: UInt32 = 0
+    /// Chains cancelled because the server showed something else, cumulative.
+    public var contradicted: UInt32 = 0
+    /// Chains or frozen overlays dropped by timeout or silence, cumulative.
+    public var expired: UInt32 = 0
+    /// The overlay currently changes what `takePaint()` draws.
+    public var displaying = false
+    /// The current mode.
+    public var mode: PredictMode = .never
+
+    public init() {}
+}
+
 /// Events reported by `MocheSession.takeEvents()`.
 ///
 /// `bell`, `title` and `resized` are one-shot; `outOfSync` and `shutdown` are

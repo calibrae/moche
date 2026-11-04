@@ -668,3 +668,390 @@ fn replay_main_capture() {
 fn replay_misc_capture() {
     replay_through_ffi(&lab().join("misc"));
 }
+
+// ---- predictive echo ----
+
+/// Simulated server for one session: sends numbered states with an optional
+/// echo ack, as datagrams sealed with the session key.
+struct Srv {
+    cipher: Cipher,
+    seq: u64,
+    num: u64,
+}
+
+impl Srv {
+    fn new() -> Srv {
+        Srv {
+            cipher: Cipher::new(&Session::from_base64(KEY).unwrap()),
+            seq: 0,
+            num: 0,
+        }
+    }
+
+    /// Next state: `host` bytes (VT) and an echo ack for client state `echo`.
+    fn state(
+        &mut self,
+        host: &[u8],
+        echo: Option<u64>,
+        ack: u64,
+        ts_reply: Option<u16>,
+    ) -> Vec<u8> {
+        use moche_core::network::{fragment, Inner};
+        use moche_core::proto::{encode_diff, Element, Instruction};
+        let mut els = Vec::new();
+        if let Some(n) = echo {
+            els.push(Element::EchoAck(n));
+        }
+        if !host.is_empty() {
+            els.push(Element::Data(host.to_vec()));
+        }
+        let i = Instruction {
+            version: 2,
+            old_num: self.num,
+            new_num: self.num + 1,
+            ack_num: ack,
+            throwaway_num: 0,
+            diff: encode_diff(&els),
+            chaff: vec![],
+        };
+        self.num += 1;
+        self.seq += 1;
+        let frag = fragment(self.seq, &i.encode()).unwrap().remove(0);
+        let inner = Inner {
+            ts: 0,
+            ts_reply,
+            frag,
+        };
+        self.cipher
+            .seal(Direction::ToClient, self.seq, &inner.encode())
+            .unwrap()
+    }
+}
+
+/// Client side of a scripted session: the C session plus a model of the host
+/// terminal that every paint is fed to.
+struct Rig {
+    s: *mut MocheSession,
+    srv: Srv,
+    client: Cipher,
+    term: Framebuffer,
+    paints: Vec<Vec<u8>>,
+    /// What the server framebuffer holds (fed with the same host bytes).
+    truth: Framebuffer,
+    /// Highest client state number sent so far (acked by every server state).
+    sent: u64,
+    /// When set, every server state carries an RTT sample of this many ms.
+    rtt: Option<u64>,
+}
+
+impl Rig {
+    fn new(cols: u16, rows: u16) -> Rig {
+        Rig {
+            s: new_session(cols, rows, 0),
+            srv: Srv::new(),
+            client: Cipher::new(&Session::from_base64(KEY).unwrap()),
+            term: Framebuffer::new(cols, rows),
+            paints: Vec::new(),
+            truth: Framebuffer::new(cols, rows),
+            sent: 0,
+            rtt: None,
+        }
+    }
+
+    fn paint(&mut self) {
+        let mut p = MocheBytes::EMPTY;
+        match moche_session_take_paint(self.s, &mut p) {
+            MOCHE_OK => {
+                let v = take(&mut p);
+                self.term.feed(&v);
+                self.paints.push(v);
+            }
+            MOCHE_NONE => {}
+            c => panic!("take_paint -> {c}"),
+        }
+    }
+
+    /// The server sends `host` (echo-acking `echo`); the pump paints.
+    fn server(&mut self, now: u64, host: &[u8], echo: Option<u64>) {
+        let reply = self.rtt.map(|r| (now.wrapping_sub(r) & 0xffff) as u16);
+        let d = self.srv.state(host, echo, self.sent, reply);
+        self.truth.feed(host);
+        assert_eq!(
+            moche_session_handle_datagram(self.s, now, d.as_ptr(), d.len()),
+            MOCHE_OK
+        );
+        self.pump(now);
+    }
+
+    /// Types `keys`; returns the client state number that carries them.
+    fn type_keys(&mut self, now: u64, keys: &[u8]) -> u64 {
+        assert_eq!(
+            moche_session_send_keys(self.s, now, keys.as_ptr(), keys.len()),
+            MOCHE_OK
+        );
+        let mut dl = 0;
+        assert_eq!(moche_session_next_deadline_ms(self.s, &mut dl), MOCHE_OK);
+        let mut top = 0;
+        while let Some(d) = poll(self.s, dl.max(now) + 1) {
+            top = top.max(client_state_num(&self.client, &d).unwrap_or(0));
+        }
+        self.sent = self.sent.max(top);
+        self.pump(now);
+        top
+    }
+
+    fn pump(&mut self, now: u64) {
+        while poll(self.s, now).is_some() {}
+        self.paint();
+    }
+
+    fn row0(&self) -> String {
+        self.term.row_text(0)
+    }
+
+    fn set_mode(&mut self, m: i32) {
+        assert_eq!(moche_session_set_predict_mode(self.s, m), MOCHE_OK);
+    }
+
+    fn deadline(&self) -> Option<u64> {
+        let mut dl = 0;
+        match moche_session_next_deadline_ms(self.s, &mut dl) {
+            MOCHE_OK => Some(dl),
+            MOCHE_NONE => None,
+            c => panic!("deadline -> {c}"),
+        }
+    }
+
+    fn pstats(&self) -> MochePredictStats {
+        let mut p = MochePredictStats::default();
+        assert_eq!(moche_session_predict_stats(self.s, &mut p), MOCHE_OK);
+        p
+    }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        moche_session_free(self.s);
+    }
+}
+
+#[test]
+fn predict_stats_layout_and_arguments() {
+    assert_eq!(std::mem::size_of::<MochePredictStats>(), 36);
+    assert_eq!(std::mem::align_of::<MochePredictStats>(), 4);
+    let r = Rig::new(20, 4);
+    let p = r.pstats();
+    assert_eq!(
+        (p.predictions, p.confirmed, p.contradicted, p.expired),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        (p.displaying, p.mode, p.pad, p.reserved),
+        (0, 0, [0; 2], [0; 4])
+    );
+    for bad in [3, -1, i32::MIN, i32::MAX] {
+        assert_eq!(moche_session_set_predict_mode(r.s, bad), MOCHE_ERR_ARG);
+        assert!(last_error().contains("predict mode"));
+    }
+    assert_eq!(r.pstats().mode, 0, "a refused mode changes nothing");
+    assert_eq!(moche_session_set_predict_mode(null_mut(), 1), MOCHE_ERR_ARG);
+    let mut p = MochePredictStats::default();
+    assert_eq!(
+        moche_session_predict_stats(null_mut(), &mut p),
+        MOCHE_ERR_ARG
+    );
+    assert_eq!(moche_session_predict_stats(r.s, null_mut()), MOCHE_ERR_ARG);
+    r.set_mode_check();
+}
+
+impl Rig {
+    fn set_mode_check(&self) {
+        for (m, want) in [(1, 1), (2, 2), (0, 0)] {
+            assert_eq!(moche_session_set_predict_mode(self.s, m), MOCHE_OK);
+            assert_eq!(self.pstats().mode, want);
+        }
+    }
+}
+
+/// The scripted session: a prompt, then typing with echoes and acks.
+fn script(r: &mut Rig) {
+    r.server(10, b"$ ", None);
+    let n = r.type_keys(100, b"a");
+    r.server(300, b"a", Some(n));
+    let n = r.type_keys(400, b"b");
+    r.server(600, b"b", Some(n));
+    let n = r.type_keys(700, b"\r");
+    r.server(900, b"\r\nout\r\n$ ", Some(n));
+}
+
+#[test]
+fn default_mode_paints_exactly_the_server_state() {
+    // golden: a model screen fed the same diffs and repainted by moche-core
+    let mut golden = Rig::new(20, 4);
+    script(&mut golden);
+    let mut model = Screen::new(20, 4);
+    let mut prev: Option<Framebuffer> = None;
+    let mut expect = Vec::new();
+    for (old, new, bytes) in [
+        (0, 1, &b"$ "[..]),
+        (1, 2, b"a"),
+        (2, 3, b"b"),
+        (3, 4, b"\r\nout\r\n$ "),
+    ] {
+        model.apply(old, new, None, bytes).unwrap();
+        let out = model.repaint(prev.as_ref());
+        // the initial paint comes before any datagram: handled below
+        expect.push(out);
+        prev = Some(model.latest().clone());
+    }
+    // paints from the C session (the very first one is the blank initial screen)
+    // are those after each server state; the echo-only states of the script
+    // change nothing visible, so compare the visible ones
+    let got = &golden.paints;
+    assert!(got.len() >= 4, "{} paints", got.len());
+    assert!(golden.term.display_eq(&golden.truth));
+    assert_eq!(&got[got.len() - 1], &expect[3]);
+    assert_eq!(&got[got.len() - 2], &expect[2]);
+
+    // explicitly NEVER is byte-identical to never calling it
+    let mut a = Rig::new(20, 4);
+    let mut b = Rig::new(20, 4);
+    b.set_mode(0);
+    script(&mut a);
+    script(&mut b);
+    assert_eq!(a.paints, b.paints);
+    assert_eq!(b.pstats().predictions, 0);
+    // and ADAPTIVE changed something while the same script ran
+    let mut c = Rig::new(20, 4);
+    c.set_mode(1);
+    script(&mut c);
+    assert_ne!(a.paints, c.paints, "adaptive paints the overlay");
+    assert!(c.pstats().predictions > 0);
+    assert!(c.term.display_eq(&c.truth), "and converges");
+    assert_eq!(c.pstats().displaying, 0);
+}
+
+#[test]
+fn adaptive_shows_prediction_before_the_echo_and_converges() {
+    let mut r = Rig::new(20, 4);
+    r.set_mode(1);
+    r.server(10, b"$ ", None);
+    assert_eq!(r.row0(), "$");
+    // srtt is 1000 before a sample: high. The first char of an epoch is hidden.
+    let n = r.type_keys(100, b"a");
+    assert_eq!(r.row0(), "$", "first char waits for the server echo");
+    r.server(300, b"a", Some(n));
+    assert_eq!(r.row0(), "$ a");
+    // now a typed char shows at once, before any server echo
+    let n = r.type_keys(400, b"b");
+    assert_eq!(r.row0(), "$ ab", "predicted before the echo");
+    assert!(!r.term.display_eq(&r.truth));
+    assert_eq!(r.term.cursor_col(), 4);
+    let ps = r.pstats();
+    assert!(ps.displaying == 1 && ps.predictions == 2 && ps.mode == 1);
+    // the paint that showed it is a normal paint
+    let last = r.paints.last().unwrap();
+    assert!(last.starts_with(b"\x1b[?25l\x1b[0m\x1b[r\x1b[?6l\x1b[?7h"));
+    assert!(!last.windows(4).any(|w| w == b"\x1b[2J"), "partial paint");
+    // the real echo arrives: identical to the server, nothing left over
+    r.server(600, b"b", Some(n));
+    assert!(r.term.display_eq(&r.truth));
+    assert_eq!(r.pstats().displaying, 0);
+    assert!(r.pstats().confirmed >= 2);
+    // nothing more to paint
+    let before = r.paints.len();
+    r.paint();
+    assert_eq!(r.paints.len(), before);
+}
+
+#[test]
+fn password_like_silence_shows_nothing_in_adaptive() {
+    let mut r = Rig::new(20, 4);
+    r.set_mode(1);
+    r.server(10, b"Password:", None);
+    let mut now = 100;
+    for k in [b"s", b"e", b"c", b"r", b"e", b"t"] {
+        let n = r.type_keys(now, k);
+        assert_eq!(r.row0(), "Password:", "typed secret never shown");
+        // the server consumes the key and echoes nothing, acking the input
+        r.server(now + 200, b"", Some(n));
+        assert_eq!(r.row0(), "Password:");
+        assert!(r.term.display_eq(&r.truth));
+        now += 300;
+    }
+    assert_eq!(r.pstats().displaying, 0);
+    assert_eq!(r.pstats().confirmed, 0);
+}
+
+#[test]
+fn deadline_includes_the_predictor_and_timer_wake_removes_expiry() {
+    let mut r = Rig::new(20, 4);
+    r.rtt = Some(80); // srtt 80 ms: predicts (>30), no underline (<85)
+    r.set_mode(1);
+    r.server(10, b"$ ", None);
+    let n = r.type_keys(100, b"a");
+    r.server(300, b"a", Some(n));
+    r.type_keys(400, b"b");
+    assert_eq!(r.row0(), "$ ab");
+    // the server acks the datagram (the transport has nothing to resend) but
+    // does not echo: the prediction stays pending
+    r.server(450, b"", None);
+    assert_eq!(r.row0(), "$ ab");
+    while poll(r.s, 700).is_some() {}
+    // the same session with predictions off: only the transport's heartbeat
+    let mut quiet = Rig::new(20, 4);
+    quiet.rtt = Some(80);
+    quiet.server(10, b"$ ", None);
+    let n = quiet.type_keys(100, b"a");
+    quiet.server(300, b"a", Some(n));
+    quiet.type_keys(400, b"b");
+    quiet.server(450, b"", None);
+    while poll(quiet.s, 700).is_some() {}
+    let transport_only = quiet.deadline().expect("heartbeat");
+    let with = r.deadline().expect("deadline");
+    assert!(transport_only > 3400, "test premise: {transport_only}");
+    // the predictor expires the shown 'b' at 400 + 3000, earlier
+    assert_eq!(with, 3400, "predictor expiry wins");
+    // the host wakes at the deadline and runs its pump: poll, then take_paint
+    while poll(r.s, with).is_some() {}
+    r.paint();
+    assert_eq!(r.row0(), "$ a", "expired prediction removed by take_paint");
+    assert!(r.pstats().expired >= 1);
+    assert!(r.term.display_eq(&r.truth));
+}
+
+#[test]
+fn resize_and_mode_change_clear_the_overlay() {
+    let mut r = Rig::new(20, 4);
+    r.set_mode(1);
+    r.server(10, b"$ ", None);
+    let n = r.type_keys(100, b"a");
+    r.server(300, b"a", Some(n));
+    r.type_keys(400, b"b");
+    assert_eq!(r.row0(), "$ ab");
+    // switching off removes the overlay at the next paint
+    r.set_mode(0);
+    r.paint();
+    assert_eq!(r.row0(), "$ a");
+    assert!(r.term.display_eq(&r.truth));
+    // a forced full repaint includes the overlay currently displayed
+    r.set_mode(1);
+    let n = r.type_keys(500, b"c");
+    r.server(700, b"c", Some(n));
+    r.type_keys(800, b"d");
+    assert_eq!(r.row0(), "$ acd");
+    assert_eq!(moche_session_force_full_paint(r.s), MOCHE_OK);
+    let mut fresh = Framebuffer::new(20, 4);
+    let mut p = MocheBytes::EMPTY;
+    assert_eq!(moche_session_take_paint(r.s, &mut p), MOCHE_OK);
+    let v = take(&mut p);
+    assert!(v.windows(4).any(|w| w == b"\x1b[2J"));
+    fresh.feed(&v);
+    assert_eq!(fresh.row_text(0), "$ acd");
+    r.term.feed(&v);
+    // a local resize drops predictions
+    assert_eq!(moche_session_send_resize(r.s, 900, 20, 4), MOCHE_OK);
+    r.paint();
+    assert_eq!(r.pstats().displaying, 0);
+    assert_eq!(r.row0(), "$ ac", "the prediction is gone");
+}

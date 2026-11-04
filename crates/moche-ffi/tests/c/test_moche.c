@@ -16,6 +16,8 @@
 /* C99 compile-time layout check: a negative array size fails the build. */
 typedef char moche_stats_size_check[sizeof(MocheStats) == 40 ? 1 : -1];
 
+typedef char moche_predict_stats_size_check[sizeof(MochePredictStats) == 36 ? 1 : -1];
+
 #define KEY "AAECAwQFBgcICQoLDA0ODw"
 
 int main(void) {
@@ -101,6 +103,25 @@ int main(void) {
     CHECK(since == 3000);
     uint32_t srtt = 0;
     CHECK(moche_session_srtt_ms(s, &srtt) == MOCHE_OK);
+
+    /* predictive echo: default NEVER, validation, stats */
+    MochePredictStats ps;
+    memset(&ps, 0xff, sizeof ps);
+    CHECK(moche_session_predict_stats(s, &ps) == MOCHE_OK);
+    CHECK(ps.mode == MOCHE_PREDICT_NEVER && ps.displaying == 0);
+    CHECK(ps.predictions == 0 && ps.confirmed == 0 && ps.contradicted == 0 && ps.expired == 0);
+    for (int i = 0; i < 4; i++) CHECK(ps.reserved[i] == 0);
+    CHECK(ps.pad[0] == 0 && ps.pad[1] == 0);
+    CHECK(moche_session_set_predict_mode(s, 3) == MOCHE_ERR_ARG);
+    CHECK(moche_session_set_predict_mode(s, -1) == MOCHE_ERR_ARG);
+    CHECK(moche_session_set_predict_mode(NULL, MOCHE_PREDICT_ADAPTIVE) == MOCHE_ERR_ARG);
+    CHECK(moche_session_predict_stats(s, NULL) == MOCHE_ERR_ARG);
+    CHECK(moche_session_predict_stats(NULL, &ps) == MOCHE_ERR_ARG);
+    CHECK(moche_session_set_predict_mode(s, MOCHE_PREDICT_ADAPTIVE) == MOCHE_OK);
+    CHECK(moche_session_predict_stats(s, &ps) == MOCHE_OK && ps.mode == MOCHE_PREDICT_ADAPTIVE);
+    CHECK(moche_session_set_predict_mode(s, MOCHE_PREDICT_ALWAYS) == MOCHE_OK);
+    CHECK(moche_session_predict_stats(s, &ps) == MOCHE_OK && ps.mode == MOCHE_PREDICT_ALWAYS);
+    CHECK(moche_session_set_predict_mode(s, MOCHE_PREDICT_NEVER) == MOCHE_OK);
 
     CHECK(moche_session_free(s) == MOCHE_OK);
     CHECK(moche_session_free(NULL) == MOCHE_OK);

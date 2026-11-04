@@ -122,4 +122,44 @@ final class SessionTests: XCTestCase {
         _ = s.modes()
         XCTAssertGreaterThan(s.screenSize.cols, 0)
     }
+
+    // MARK: predictive echo
+
+    func testPredictStatsFreshSessionIsZeroAndNever() throws {
+        let s = try makeSession()
+        XCTAssertEqual(try s.predictStats(), MochePredictStats())
+        XCTAssertEqual(try s.predictStats().mode, .never)
+    }
+
+    func testSetPredictModeRoundTripsAndKeysStillGo() throws {
+        let s = try makeSession(now: 0)
+        for m in [PredictMode.adaptive, .always, .never] {
+            try s.setPredictMode(m)
+            XCTAssertEqual(try s.predictStats().mode, m)
+        }
+        // display only: sending keys works the same with predictions on
+        try s.setPredictMode(.adaptive)
+        try s.sendKeys(Data("a".utf8), nowMs: 0)
+        let deadline = try XCTUnwrap(try s.nextDeadlineMs())
+        XCTAssertNotNil(try s.pollTransmit(nowMs: deadline + 1000))
+        XCTAssertEqual(try s.stats().queuedBytes, 1)
+    }
+
+    func testDefaultPaintIsUnchangedByNeverMode() throws {
+        let a = try makeSession(key: capturedKey, now: 0)
+        let b = try makeSession(key: capturedKey, now: 0)
+        try b.setPredictMode(.never)
+        for s in [a, b] { XCTAssertTrue(try s.handleDatagram(data(hex: capturedDatagramHex), nowMs: 5)) }
+        XCTAssertEqual(try a.takePaint(), try b.takePaint())
+    }
+
+    func testUnknownPredictModeThrows() throws {
+        let s = try makeSession()
+        for bad: Int32 in [3, -1, Int32.max] {
+            XCTAssertThrowsError(try s.setPredictMode(rawValue: bad)) { e in
+                guard case .arg = e as? MocheError else { return XCTFail("\(e)") }
+            }
+        }
+        XCTAssertEqual(try s.predictStats().mode, .never)
+    }
 }

@@ -26,6 +26,7 @@ use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use connect::ConnectError;
+use moche_core::predict::PredictMode;
 use session::{dim_ok, Core, Fed, MAX_KEYS};
 
 pub const MOCHE_OK: i32 = 0;
@@ -95,6 +96,25 @@ pub struct MocheStats {
     pub rx_gaps: u32,
     pub reserved: [u32; 5],
 }
+
+/// Predictive echo counters and state, see `moche.h`. 40 bytes, 4-aligned, no
+/// padding: four `u32` (16) + `displaying`, `mode`, `pad[2]` (4) + `reserved[4]` (16).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MochePredictStats {
+    pub predictions: u32,
+    pub confirmed: u32,
+    pub contradicted: u32,
+    pub expired: u32,
+    pub displaying: u8,
+    pub mode: u8,
+    pub pad: [u8; 2],
+    pub reserved: [u32; 4],
+}
+
+pub const MOCHE_PREDICT_NEVER: i32 = 0;
+pub const MOCHE_PREDICT_ADAPTIVE: i32 = 1;
+pub const MOCHE_PREDICT_ALWAYS: i32 = 2;
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
@@ -549,6 +569,47 @@ pub extern "C" fn moche_session_stats(s: *mut MocheSession, out: *mut MocheStats
                 rx_errors: c.rx_errors,
                 rx_gaps: c.rx_gaps,
                 reserved: [0; 5],
+            },
+        )?;
+        Ok(MOCHE_OK)
+    })
+}
+
+/// Chooses predictive local echo: NEVER (0, the default), ADAPTIVE (1) or
+/// ALWAYS (2). Display only; never changes what is sent.
+#[no_mangle]
+pub extern "C" fn moche_session_set_predict_mode(s: *mut MocheSession, mode: i32) -> i32 {
+    run_s(s, |core| {
+        let m = match mode {
+            MOCHE_PREDICT_NEVER => PredictMode::Never,
+            MOCHE_PREDICT_ADAPTIVE => PredictMode::Adaptive,
+            MOCHE_PREDICT_ALWAYS => PredictMode::Always,
+            _ => return Err(fail(MOCHE_ERR_ARG, "unknown predict mode")),
+        };
+        core.set_predict_mode(m);
+        Ok(MOCHE_OK)
+    })
+}
+
+/// Predictive echo counters and state.
+#[no_mangle]
+pub extern "C" fn moche_session_predict_stats(
+    s: *mut MocheSession,
+    out: *mut MochePredictStats,
+) -> i32 {
+    run_s(s, |core| {
+        let p = core.predict_stats();
+        put(
+            out,
+            MochePredictStats {
+                predictions: p.predictions,
+                confirmed: p.confirmed,
+                contradicted: p.contradicted,
+                expired: p.expired,
+                displaying: u8::from(p.displaying),
+                mode: p.mode,
+                pad: [0; 2],
+                reserved: [0; 4],
             },
         )?;
         Ok(MOCHE_OK)

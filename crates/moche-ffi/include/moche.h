@@ -55,13 +55,15 @@
  *   moche_find_connect(stdout_buf, stdout_len, &port, key);
  *   MocheSession *s;
  *   moche_session_new(key, MOCHE_KEY_CHARS, cols, rows, now, &s);
+ *   // optional: moche_session_set_predict_mode(s, MOCHE_PREDICT_ADAPTIVE);
  *   // wipe `key`; open a UDP socket to <server host>:port
  *
  *   // one "pump", run on the session's queue after EVERY event below:
  *   //   - a UDP datagram arrived        -> moche_session_handle_datagram
  *   //   - the user typed / pasted       -> moche_session_send_keys
  *   //   - the view changed size         -> moche_session_send_resize
- *   //   - the timer fired
+ *   //   - the timer fired (it also fires for predictive-echo expiry: see
+ *   //     PREDICTIVE ECHO; run the WHOLE pump, take_paint included)
  *   //
  *   // BACKPRESSURE for big pastes: do not hand a whole paste to
  *   // moche_session_send_keys at once. Feed it in slices (say 64 KiB) from your
@@ -128,6 +130,59 @@
  *  changes (MOCHE_EVENT_RESIZED) the next paint is already a full repaint.
  *  Size your view to match, or call moche_session_force_full_paint after you
  *  recreate or resize the view.
+ *
+ *  SGR underline (ESC[4m, reset by ESC[24m or ESC[0m) is part of the stream
+ *  since predictive echo (below): a predicted cell is either ordinary text
+ *  or, on a slow link, underlined. With predictive echo off (the default) the
+ *  stream is exactly what it was before this feature existed, and the server's
+ *  own underline attribute is carried as before. Every other rule above
+ *  (preamble, absolute rows, no scrolling, the toggled modes) holds with
+ *  overlays unchanged.
+ *
+ * PREDICTIVE ECHO
+ *
+ *  Like mosh's best-known feature: typed characters appear at once instead of
+ *  one round trip later, and are then reconciled with the server's real state.
+ *
+ *   - OPT IN. A session starts in MOCHE_PREDICT_NEVER: nothing is predicted and
+ *     every call behaves exactly as before. Call moche_session_set_predict_mode
+ *     to enable it (ADAPTIVE is the sensible choice).
+ *   - DISPLAY ONLY. Predictions are drawn into a copy of the screen that only
+ *     moche_session_take_paint returns. They never change what is sent to the
+ *     server, the screen model, the modes, the events or the deadlines of the
+ *     transport; a wrong guess costs a repaint of one row, never a wrong
+ *     byte on the wire.
+ *   - MODES. NEVER: no prediction. ADAPTIVE: predict while the smoothed RTT
+ *     (moche_session_srtt_ms) is above about 30 ms (stops below 20 ms), and
+ *     only after the server's real echo has confirmed a prediction of the
+ *     current epoch. ALWAYS: predict at any RTT and show the first prediction
+ *     of an epoch before any confirmation. CAVEAT: with ALWAYS a secret typed
+ *     where nothing echoes (a password prompt) is visible on screen for about
+ *     one round trip plus 50 ms, until the server's echo ack names it, then it
+ *     is erased. Do not offer ALWAYS to users who type passwords through it.
+ *   - PASSWORD PROMPTS. In ADAPTIVE nothing typed at a prompt that does not
+ *     echo is ever displayed: an epoch only starts showing after the server
+ *     echoed one of its characters.
+ *   - WHAT IS PREDICTED. Printable single-width characters typed at the end of
+ *     a line, backspace and left/right arrows. Enter, Tab, control keys, other
+ *     escapes, pastes, full-screen programs (alternate screen, mouse reporting
+ *     or hidden cursor) end the epoch and are not predicted. Predictions are
+ *     dropped on resize, on scrolling or screen redraws (anything the server
+ *     does that contradicts them) and on the alternate screen.
+ *   - THE HOST MUST KEEP PUMPING. A prediction that the server never confirms
+ *     is removed after max(3 s, 4 x srtt), and the underline fades when the
+ *     echo arrives. moche_session_next_deadline_ms already includes that time,
+ *     so your single timer wakes in time; on that wake you must call
+ *     moche_session_take_paint (the sketch's pump does): the removal is
+ *     painted there. Call poll_transmit (or any call that takes now_ms) before
+ *     take_paint in the same pump, as in the sketch, so the library sees the
+ *     current time.
+ *   - PAINT. take_paint paints "server state + overlay", changed rows only
+ *     (a prediction appearing, changing or disappearing rewrites its row, with
+ *     the usual preamble); after moche_session_force_full_paint a full repaint
+ *     includes the overlay currently displayed.
+ *   - moche_session_predict_stats reports counters, for a settings screen or
+ *     debugging.
  */
 
 #ifndef MOCHE_H
@@ -232,6 +287,26 @@ typedef struct MocheStats {
     uint32_t reserved[5];   /* zero */
 } MocheStats;
 
+/* Predictive echo modes, for moche_session_set_predict_mode. */
+#define MOCHE_PREDICT_NEVER 0    /* default: nothing predicted */
+#define MOCHE_PREDICT_ADAPTIVE 1 /* predict while the RTT is high, epoch-gated */
+#define MOCHE_PREDICT_ALWAYS 2   /* predict at any RTT; may show a secret briefly */
+
+/* Predictive echo counters and state (moche_session_predict_stats). 36 bytes,
+ * 4-byte aligned, no hidden padding; new fields are taken from `reserved`,
+ * which is always zero for now. Counters are cumulative since the session was
+ * created (a mode change does not reset them) and saturate at UINT32_MAX. */
+typedef struct MochePredictStats {
+    uint32_t predictions;  /* typed keys turned into predictions (shown or hidden) */
+    uint32_t confirmed;    /* predictions the server's echo confirmed */
+    uint32_t contradicted; /* chains cancelled because the server showed something else */
+    uint32_t expired;      /* chains or frozen overlays dropped by timeout or silence */
+    uint8_t displaying;    /* 1: the overlay currently changes what take_paint draws */
+    uint8_t mode;          /* current MOCHE_PREDICT_* value */
+    uint8_t pad[2];        /* zero */
+    uint32_t reserved[4];  /* zero */
+} MochePredictStats;
+
 /* ---- general ------------------------------------------------------------ */
 
 /* Library version, a NUL-terminated static string. */
@@ -299,7 +374,8 @@ int32_t moche_session_poll_transmit(MocheSession *s, uint64_t now_ms,
 /* MOCHE_OK with the absolute time (same clock as now_ms) at which
  * moche_session_poll_transmit next has work; a value at or before now means
  * "now". MOCHE_NONE (*out = 0): nothing scheduled. Re-arm your single timer
- * from this after every pump. */
+ * from this after every pump. With predictive echo on, it also covers the
+ * time a prediction expires; wake, then run the whole pump (take_paint). */
 int32_t moche_session_next_deadline_ms(MocheSession *s, uint64_t *out);
 
 /* ---- screen ------------------------------------------------------------- */
@@ -355,6 +431,21 @@ int32_t moche_session_srtt_ms(MocheSession *s, uint32_t *out);
  * Counters saturate at UINT32_MAX. Returns MOCHE_OK, MOCHE_ERR_ARG (NULL s or
  * out) or MOCHE_ERR_DEAD. */
 int32_t moche_session_stats(MocheSession *s, MocheStats *out);
+
+/* ---- predictive echo ---------------------------------------------------- */
+
+/* Chooses MOCHE_PREDICT_NEVER (0, the default of every new session, so an app
+ * that never calls this behaves exactly as before), MOCHE_PREDICT_ADAPTIVE (1)
+ * or MOCHE_PREDICT_ALWAYS (2); see PREDICTIVE ECHO. Changing the mode drops
+ * the pending predictions (the next take_paint removes them from the view).
+ * Display only: what is sent never changes. Returns MOCHE_OK, MOCHE_ERR_ARG
+ * (NULL s, or a mode outside 0..2) or MOCHE_ERR_DEAD. */
+int32_t moche_session_set_predict_mode(MocheSession *s, int32_t mode);
+
+/* Fills *out (see MochePredictStats). All zero except `mode` on a session that
+ * never enabled predictions. Returns MOCHE_OK, MOCHE_ERR_ARG (NULL s or out) or
+ * MOCHE_ERR_DEAD. */
+int32_t moche_session_predict_stats(MocheSession *s, MochePredictStats *out);
 
 #ifdef __cplusplus
 }

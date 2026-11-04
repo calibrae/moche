@@ -98,6 +98,32 @@ actor MoshConnection {
 }
 ```
 
+## Predictive echo
+
+Typed characters can appear at once instead of one round trip later (mosh's best-known
+feature). It is **off by default**: a new session is `.never` and behaves exactly as before.
+Opt in once per session:
+
+```swift
+try session.setPredictMode(.adaptive)   // .never (default), .adaptive, .always
+let stats = try session.predictStats()  // predictions, confirmed, contradicted, expired, displaying, mode
+```
+
+- Display only: predictions are drawn by `takePaint()` (server screen plus an overlay, changed
+  rows only) and never change what is sent. A wrong guess costs a one-row repaint.
+- `.adaptive` predicts while the smoothed RTT is above about 30 ms and only after the server
+  echoed a character of the current epoch, so a password prompt never shows what is typed.
+  `.always` predicts at any RTT and shows the first prediction before any confirmation: a
+  secret typed where nothing echoes is visible for about one round trip plus 50 ms. Do not use
+  it for password entry.
+- Predicted cells are ordinary text, or underlined (SGR 4) on a slow link: the paint stream
+  now may carry underline. Everything else in the PAINT STREAM contract of `moche.h` holds.
+- Predictions are dropped on resize, scroll or screen redraw, and in full-screen programs.
+- **Timer:** an unconfirmed prediction is removed after max(3 s, 4 x srtt). That deadline is
+  already folded into `nextDeadlineMs()`, so the actor sketch's single timer needs no change;
+  but the pump that runs on the timer must call `takePaint()` (the sketch's does), and
+  `pollTransmit`/any call with `nowMs` before it so the library sees the current time.
+
 ## Backpressure for pastes
 
 Everything you send is one ordered stream. A multi-megabyte paste handed over in one

@@ -13,7 +13,8 @@ import MocheFFI
 ///
 /// Pump, after every event (datagram, keys, resize, timer):
 /// `pollTransmit` until nil (send each), `takePaint` (feed to the terminal view),
-/// `takeEvents`, then re-arm one timer from `nextDeadlineMs`.
+/// `takeEvents`, then re-arm one timer from `nextDeadlineMs` (which also covers the expiry
+/// of predictive echo: run the whole pump, `takePaint` included, when the timer fires).
 public final class MocheSession {
     private var handle: OpaquePointer?
 
@@ -157,6 +158,44 @@ public final class MocheSession {
         s.sendErrors = c.send_errors
         s.rxErrors = c.rx_errors
         s.rxGaps = c.rx_gaps
+        return s
+    }
+
+    // MARK: predictive echo
+
+    /// Chooses predictive local echo; the default of a new session is `.never`, so an app
+    /// that never calls this behaves exactly as before. Changing the mode drops the pending
+    /// predictions (the next `takePaint()` removes them from the view).
+    ///
+    /// Predictions are drawn by `takePaint()`, as ordinary text or, on a slow link,
+    /// underlined (SGR 4, now part of the paint stream). They expire on a timer that is
+    /// already folded into `nextDeadlineMs()`: when your timer fires, run the whole pump
+    /// (`takePaint` included), or an expired guess stays on screen.
+    /// - Throws: `.sessionDead` after an internal error.
+    public func setPredictMode(_ mode: PredictMode) throws {
+        try setPredictMode(rawValue: mode.rawValue)
+    }
+
+    /// Raw form, so tests can reach the library's refusal of an unknown mode (`.arg`).
+    func setPredictMode(rawValue: Int32) throws {
+        let rc = moche_session_set_predict_mode(handle, rawValue)
+        if rc != MOCHE_OK { throw MocheError.make(rc) }
+    }
+
+    /// Predictive echo counters and state (all zero, mode `.never`, on a session that
+    /// never enabled it).
+    /// - Throws: `.sessionDead` if the session died after an internal error.
+    public func predictStats() throws -> MochePredictStats {
+        var c = MocheFFI.MochePredictStats()
+        let rc = moche_session_predict_stats(handle, &c)
+        if rc != MOCHE_OK { throw MocheError.make(rc) }
+        var s = MochePredictStats()
+        s.predictions = c.predictions
+        s.confirmed = c.confirmed
+        s.contradicted = c.contradicted
+        s.expired = c.expired
+        s.displaying = c.displaying != 0
+        s.mode = PredictMode(rawValue: Int32(c.mode)) ?? .never
         return s
     }
 

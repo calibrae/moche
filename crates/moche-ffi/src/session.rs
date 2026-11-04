@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use moche_core::crypto::Session;
-use moche_core::screen::{Framebuffer, Screen, ScreenEvent, MAX_DIM};
+use moche_core::predict::{PredictMode, PredictStats, Predictor};
+use moche_core::screen::{repaint, Framebuffer, Screen, ScreenEvent, MAX_DIM};
 use moche_core::ssp::{Event, Rng, Transport};
 
 /// Event bits, see `moche.h`.
@@ -49,11 +50,47 @@ pub struct StatsSnapshot {
     pub rx_gaps: u32,
 }
 
+/// What the host terminal currently shows.
+enum Painted {
+    /// Nothing known: the next paint is a full repaint.
+    None,
+    /// A server state, shared with the screen (no copy).
+    Server(Arc<Framebuffer>),
+    /// A server state plus the prediction overlay (one owned copy).
+    Overlay(Box<Framebuffer>),
+}
+
+impl Painted {
+    fn get(&self) -> Option<&Framebuffer> {
+        match self {
+            Painted::None => None,
+            Painted::Server(a) => Some(a),
+            Painted::Overlay(f) => Some(f),
+        }
+    }
+}
+
+/// Plain copy of the predictor counters and state, see `moche.h`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PredictSnapshot {
+    pub predictions: u32,
+    pub confirmed: u32,
+    pub contradicted: u32,
+    pub expired: u32,
+    pub displaying: bool,
+    pub mode: u8,
+}
+
 pub struct Core {
     transport: Transport,
     screen: Screen,
-    /// What the host terminal currently shows; `None` forces a full repaint.
-    painted: Option<Arc<Framebuffer>>,
+    /// Display-only predictive echo; `Never` unless the host opts in.
+    predictor: Predictor,
+    /// What the host terminal currently shows (server state, or server state
+    /// plus overlay); kept apart from `screen`, the base of every diff.
+    painted: Painted,
+    /// A recycled overlay grid, so an active overlay costs one memcpy per paint.
+    spare: Option<Box<Framebuffer>>,
     dirty: bool,
     pending_resize: Option<(u16, u16)>,
     edge: u32,
@@ -102,7 +139,9 @@ impl Core {
         Ok(Core {
             transport,
             screen: Screen::new(cols, rows),
-            painted: None,
+            predictor: Predictor::new(PredictMode::Never),
+            painted: Painted::None,
+            spare: None,
             dirty: true,
             pending_resize: None,
             edge: 0,
@@ -175,6 +214,12 @@ impl Core {
             }
         }
         self.screen.discard_below(self.transport.peer_throwaway());
+        if self.predictor.mode() != PredictMode::Never {
+            let echoed = self.transport.echoed_input_bytes();
+            self.dirty |= self
+                .predictor
+                .on_server_state(self.screen.latest(), echoed, now);
+        }
         let f = self.screen.latest();
         if (f.cols(), f.rows()) != before {
             self.edge |= EV_RESIZED;
@@ -185,11 +230,26 @@ impl Core {
     pub fn send_keys(&mut self, now: u64, keys: &[u8]) {
         let now = self.clock(now);
         self.transport.send_keys(now, keys);
+        if self.predictor.mode() != PredictMode::Never && !keys.is_empty() {
+            let changed = self.predictor.on_input(
+                now,
+                keys,
+                self.screen.latest(),
+                self.transport.srtt_ms(),
+                self.transport.input_bytes_total(),
+            );
+            self.dirty |= changed;
+        }
     }
 
     pub fn send_resize(&mut self, now: u64, cols: u16, rows: u16) {
         let now = self.clock(now);
         self.transport.send_resize(now, cols, rows);
+        if self.predictor.mode() != PredictMode::Never {
+            // nothing predicted survives a resize; the next paint removes it
+            self.dirty |= self.predictor.is_displaying();
+            self.predictor.on_resize();
+        }
     }
 
     pub fn poll_transmit(&mut self, now: u64) -> Option<Vec<u8>> {
@@ -198,30 +258,94 @@ impl Core {
     }
 
     pub fn next_deadline(&self) -> Option<u64> {
-        self.transport.next_deadline_ms()
+        let t = self.transport.next_deadline_ms();
+        match (t, self.predictor.next_deadline_ms()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Chooses the predictive echo mode; pending predictions are dropped.
+    pub fn set_predict_mode(&mut self, mode: PredictMode) {
+        if self.predictor.mode() != mode {
+            self.dirty |= self.predictor.is_displaying();
+            self.predictor.set_mode(mode);
+        }
+    }
+
+    pub fn predict_stats(&self) -> PredictSnapshot {
+        let sat = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        let s: PredictStats = self.predictor.stats();
+        PredictSnapshot {
+            predictions: sat(s.predicted),
+            confirmed: sat(s.confirmed),
+            contradicted: sat(s.mismatches),
+            expired: sat(s.expired),
+            displaying: self.predictor.is_displaying(),
+            mode: match self.predictor.mode() {
+                PredictMode::Never => 0,
+                PredictMode::Adaptive => 1,
+                PredictMode::Always => 2,
+            },
+        }
+    }
+
+    fn set_painted(&mut self, p: Painted) {
+        if let Painted::Overlay(old) = std::mem::replace(&mut self.painted, p) {
+            self.spare = Some(old);
+        }
     }
 
     /// Bytes for the host terminal, advancing the painted state. `None` when
     /// the host already shows the current screen.
     pub fn take_paint(&mut self) -> Option<Vec<u8>> {
+        if self.predictor.mode() != PredictMode::Never {
+            // Expiry runs on the host's clock as last seen (every call that
+            // takes `now` advances it; the pump polls before painting).
+            let silent = self
+                .last_now
+                .saturating_sub(self.last_contact.unwrap_or(self.created));
+            let srtt = self.transport.srtt_ms();
+            self.dirty |= self.predictor.tick(self.last_now, srtt, silent);
+        }
         if !std::mem::take(&mut self.dirty) {
             return None;
         }
         let latest = self.screen.latest_shared();
-        if self
-            .painted
-            .as_ref()
-            .is_some_and(|p| Arc::ptr_eq(p, &latest) || p.display_eq(&latest))
-        {
+        if self.predictor.is_displaying() {
+            // server state + overlay, drawn into a recycled copy
+            let mut buf = match self.spare.take() {
+                Some(mut b) => {
+                    (*b).clone_from(&latest);
+                    b
+                }
+                None => Box::new(Framebuffer::clone(&latest)),
+            };
+            self.predictor.apply_overlay(&mut buf);
+            let out = if self.painted.get().is_some_and(|p| p.display_eq(&buf)) {
+                None
+            } else {
+                Some(repaint(&buf, self.painted.get()))
+            };
+            self.set_painted(Painted::Overlay(buf));
+            return out;
+        }
+        let same = match &self.painted {
+            Painted::Server(p) => Arc::ptr_eq(p, &latest) || p.display_eq(&latest),
+            Painted::Overlay(p) => p.display_eq(&latest),
+            Painted::None => false,
+        };
+        if same {
+            // the terminal already shows it: no write, painted state kept
             return None;
         }
-        let out = self.screen.repaint(self.painted.as_deref());
-        self.painted = Some(latest);
+        let out = self.screen.repaint(self.painted.get());
+        self.set_painted(Painted::Server(latest));
         Some(out)
     }
 
     pub fn force_full_paint(&mut self) {
-        self.painted = None;
+        self.set_painted(Painted::None);
         self.dirty = true;
     }
 
