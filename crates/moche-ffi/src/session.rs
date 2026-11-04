@@ -1,8 +1,9 @@
 //! The state behind a `MocheSession*`: transport, screen model and paint
 //! bookkeeping. Safe Rust; the FFI layer only adds pointers and error codes.
 
+use std::sync::Arc;
+
 use moche_core::crypto::Session;
-use moche_core::network::{Cipher, Direction};
 use moche_core::screen::{Framebuffer, Screen, ScreenEvent, MAX_DIM};
 use moche_core::ssp::{Event, Rng, Transport};
 
@@ -50,10 +51,9 @@ pub struct StatsSnapshot {
 
 pub struct Core {
     transport: Transport,
-    cipher: Cipher,
     screen: Screen,
     /// What the host terminal currently shows; `None` forces a full repaint.
-    painted: Option<Framebuffer>,
+    painted: Option<Arc<Framebuffer>>,
     dirty: bool,
     pending_resize: Option<(u16, u16)>,
     edge: u32,
@@ -97,12 +97,10 @@ impl Core {
         let now = now.min(MAX_NOW);
         let session = Session::from_base64(key)?;
         let mut transport = Transport::new(&session, now, os_rng());
-        let cipher = Cipher::new(&session);
         drop(session);
         transport.send_resize(now, cols, rows);
         Ok(Core {
             transport,
-            cipher,
             screen: Screen::new(cols, rows),
             painted: None,
             dirty: true,
@@ -127,23 +125,21 @@ impl Core {
 
     pub fn datagram(&mut self, now: u64, data: &[u8]) -> Fed {
         let now = self.clock(now);
-        let Ok(opened) = self.cipher.open(data) else {
-            return Fed::Dropped;
-        };
-        if opened.direction != Direction::ToClient {
-            return Fed::Dropped;
-        }
-        // Only a newer sequence number counts as proof of life: a replayed
-        // old datagram must not keep a dead connection looking alive.
-        if self.highest_seq.is_none_or(|h| opened.seq > h) {
-            self.highest_seq = Some(opened.seq);
-            self.last_contact = Some(now);
-        }
         let before = {
             let f = self.screen.latest();
             (f.cols(), f.rows())
         };
-        for ev in self.transport.handle_datagram(now, data) {
+        // One decryption: the transport authenticates and processes the datagram.
+        let Some((seq, events)) = self.transport.receive(now, data) else {
+            return Fed::Dropped;
+        };
+        // Only a newer sequence number counts as proof of life: a replayed
+        // old datagram must not keep a dead connection looking alive.
+        if self.highest_seq.is_none_or(|h| seq > h) {
+            self.highest_seq = Some(seq);
+            self.last_contact = Some(now);
+        }
+        for ev in events {
             match ev {
                 Event::HostResize { width, height, .. } => {
                     self.pending_resize = Some((width, height))
@@ -211,12 +207,16 @@ impl Core {
         if !std::mem::take(&mut self.dirty) {
             return None;
         }
-        let latest = self.screen.latest();
-        if self.painted.as_ref().is_some_and(|p| p.display_eq(latest)) {
+        let latest = self.screen.latest_shared();
+        if self
+            .painted
+            .as_ref()
+            .is_some_and(|p| Arc::ptr_eq(p, &latest) || p.display_eq(&latest))
+        {
             return None;
         }
-        let out = self.screen.repaint(self.painted.as_ref());
-        self.painted = Some(latest.clone());
+        let out = self.screen.repaint(self.painted.as_deref());
+        self.painted = Some(latest);
         Some(out)
     }
 

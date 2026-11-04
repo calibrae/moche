@@ -55,7 +55,9 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use crate::crypto::Session;
-use crate::network::{fragment, Cipher, Direction, Inner, NetError, Reassembler, Rtt};
+#[cfg(test)]
+use crate::network::fragment;
+use crate::network::{Cipher, Deflater, Direction, Inner, NetError, Opened, Reassembler, Rtt};
 use crate::proto::{decode_diff, encode_diff, Element, Instruction, MAX_CHAFF, PROTOCOL_VERSION};
 
 /// `new_num` marking the end of the session.
@@ -134,6 +136,7 @@ pub enum Event {
 /// Client-side SSP endpoint.
 pub struct Transport {
     cipher: Cipher,
+    deflater: Deflater,
     rng: Rng,
     created: u64,
     // sending
@@ -191,6 +194,7 @@ impl Transport {
     pub fn new(session: &Session, now_ms: u64, rng: Rng) -> Self {
         Transport {
             cipher: Cipher::new(session),
+            deflater: Deflater::new(),
             rng,
             created: now_ms,
             seq: 0,
@@ -312,12 +316,25 @@ impl Transport {
     /// Processes one received UDP datagram. Datagrams that fail
     /// authentication, are malformed, or are stale yield no events.
     pub fn handle_datagram(&mut self, now_ms: u64, datagram: &[u8]) -> Vec<Event> {
-        let Ok(opened) = self.cipher.open(datagram) else {
-            return Vec::new();
-        };
+        self.receive(now_ms, datagram)
+            .map_or_else(Vec::new, |(_, events)| events)
+    }
+
+    /// Like [`Transport::handle_datagram`], but also tells the caller whether the
+    /// datagram authenticated as a server datagram: `None` for a datagram that is
+    /// too short, forged or wrongly directed (dropped), else its sequence number
+    /// and the events (possibly none). Lets a host classify and process a
+    /// datagram with a single decryption.
+    pub fn receive(&mut self, now_ms: u64, datagram: &[u8]) -> Option<(u64, Vec<Event>)> {
+        let opened = self.cipher.open(datagram).ok()?;
         if opened.direction != Direction::ToClient {
-            return Vec::new();
+            return None;
         }
+        let seq = opened.seq;
+        Some((seq, self.handle_opened(now_ms, opened)))
+    }
+
+    fn handle_opened(&mut self, now_ms: u64, opened: Opened) -> Vec<Event> {
         let Ok(inner) = Inner::decode(&opened.plaintext) else {
             return Vec::new();
         };
@@ -639,7 +656,7 @@ impl Transport {
     fn emit(&mut self, now_ms: u64, message: &[u8]) -> Result<(), NetError> {
         let id = self.frag_id;
         self.frag_id += 1;
-        let frags = fragment(id, message)?;
+        let frags = self.deflater.fragment(id, message)?;
         for (k, frag) in frags.into_iter().enumerate() {
             let ts_reply = if k == 0 {
                 self.take_reply(now_ms)

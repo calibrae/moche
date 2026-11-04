@@ -5,13 +5,11 @@
 //! big-endian. The serialized instruction is zlib-compressed once, cut into
 //! [`FRAGMENT_PAYLOAD`]-byte pieces, and each piece is sealed on its own.
 
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
-
 use aes::Aes128;
-use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use ocb3::aead::{Aead, KeyInit, Payload};
 use ocb3::Ocb3;
+use std::collections::BTreeMap;
 
 use crate::crypto::{
     build_nonce, split_wire_nonce, Session, DIRECTION_BIT, TAG_LEN, WIRE_NONCE_LEN,
@@ -218,27 +216,83 @@ impl Cipher {
     }
 }
 
+/// Reusable zlib compressor. Building a deflate state allocates and zeroes
+/// several hundred KiB, so a long-lived sender keeps one and resets it per message
+/// (the output is byte-identical to a fresh encoder).
+pub struct Deflater {
+    z: Compress,
+}
+
+impl Default for Deflater {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Deflater {
+    /// A compressor at the default level (same as [`fragment`]).
+    pub fn new() -> Self {
+        Deflater {
+            z: Compress::new(Compression::default(), true),
+        }
+    }
+
+    /// Compresses a serialized instruction and cuts it into fragments sharing `id`.
+    pub fn fragment(&mut self, id: u64, message: &[u8]) -> Result<Vec<Fragment>, NetError> {
+        let z = self.compress(message)?;
+        let n = z.len().div_ceil(FRAGMENT_PAYLOAD).max(1);
+        if n > usize::from(MAX_FRAGMENTS) {
+            return Err(NetError::TooLarge);
+        }
+        Ok((0..n)
+            .map(|i| Fragment {
+                id,
+                num: i as u16,
+                last: i + 1 == n,
+                data: z
+                    .chunks(FRAGMENT_PAYLOAD)
+                    .nth(i)
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    /// zlib stream of `message`: the input is fed with no flush, then the stream
+    /// is finished, which is what a streaming encoder's `write_all` + `finish` does.
+    fn compress(&mut self, message: &[u8]) -> Result<Vec<u8>, NetError> {
+        self.z.reset();
+        let mut out = Vec::with_capacity(message.len() / 2 + 64);
+        let mut input = message;
+        while !input.is_empty() {
+            if out.capacity() - out.len() < 64 {
+                out.reserve(message.len() / 2 + 64);
+            }
+            let before = self.z.total_in();
+            self.z
+                .compress_vec(input, &mut out, FlushCompress::None)
+                .map_err(|_| NetError::Inflate)?;
+            input = &input[(self.z.total_in() - before) as usize..];
+        }
+        loop {
+            if out.capacity() - out.len() < 64 {
+                out.reserve(256);
+            }
+            match self
+                .z
+                .compress_vec(&[], &mut out, FlushCompress::Finish)
+                .map_err(|_| NetError::Inflate)?
+            {
+                Status::StreamEnd => return Ok(out),
+                Status::Ok | Status::BufError => {}
+            }
+        }
+    }
+}
+
 /// Compresses a serialized instruction and cuts it into fragments sharing `id`.
 pub fn fragment(id: u64, message: &[u8]) -> Result<Vec<Fragment>, NetError> {
-    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-    enc.write_all(message).map_err(|_| NetError::Inflate)?;
-    let z = enc.finish().map_err(|_| NetError::Inflate)?;
-    let n = z.len().div_ceil(FRAGMENT_PAYLOAD).max(1);
-    if n > usize::from(MAX_FRAGMENTS) {
-        return Err(NetError::TooLarge);
-    }
-    Ok((0..n)
-        .map(|i| Fragment {
-            id,
-            num: i as u16,
-            last: i + 1 == n,
-            data: z
-                .chunks(FRAGMENT_PAYLOAD)
-                .nth(i)
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default(),
-        })
-        .collect())
+    Deflater::new().fragment(id, message)
 }
 
 #[derive(Default)]
@@ -250,10 +304,21 @@ struct Group {
 /// Collects fragments into messages. Tolerates duplicates and reordering,
 /// keeps at most [`MAX_GROUPS`] incomplete messages, and ignores any message
 /// with an id at or below the newest one already completed.
-#[derive(Default)]
 pub struct Reassembler {
     groups: BTreeMap<u64, Group>,
     done: Option<u64>,
+    /// Reused inflate state (building one allocates tens of KiB).
+    z: Decompress,
+}
+
+impl Default for Reassembler {
+    fn default() -> Self {
+        Reassembler {
+            groups: BTreeMap::new(),
+            done: None,
+            z: Decompress::new(true),
+        }
+    }
 }
 
 impl Reassembler {
@@ -278,6 +343,16 @@ impl Reassembler {
             }
             self.groups.remove(&oldest);
         }
+        if f.last
+            && f.num == 0
+            && f.data.len() <= FRAGMENT_PAYLOAD
+            && !self.groups.contains_key(&f.id)
+        {
+            // Whole message in one fragment (the common case): no bookkeeping.
+            self.groups.retain(|&id, _| id > f.id);
+            self.done = Some(f.id);
+            return inflate(&mut self.z, &f.data).map(Some);
+        }
         let g = self.groups.entry(f.id).or_default();
         let bad = f.data.len() > FRAGMENT_PAYLOAD
             || (f.last && g.last.is_some_and(|l| l != f.num))
@@ -298,20 +373,37 @@ impl Reassembler {
         let compressed: Vec<u8> = g.parts.values().flatten().copied().collect();
         self.groups.retain(|&id, _| id > f.id);
         self.done = Some(f.id);
-        inflate(&compressed).map(Some)
+        inflate(&mut self.z, &compressed).map(Some)
     }
 }
 
-fn inflate(z: &[u8]) -> Result<Vec<u8>, NetError> {
-    let mut out = Vec::new();
-    ZlibDecoder::new(z)
-        .take(MAX_INFLATED + 1)
-        .read_to_end(&mut out)
-        .map_err(|_| NetError::Inflate)?;
-    if out.len() as u64 > MAX_INFLATED {
-        return Err(NetError::Inflate);
+fn inflate(d: &mut Decompress, z: &[u8]) -> Result<Vec<u8>, NetError> {
+    d.reset(true);
+    let mut out: Vec<u8> = Vec::with_capacity((z.len() * 4).clamp(256, 1 << 16));
+    loop {
+        if out.capacity() - out.len() < 256 {
+            out.reserve(out.len().max(4096));
+        }
+        let (in0, out0) = (d.total_in(), out.len());
+        let status = d
+            .decompress_vec(
+                &z[(in0 as usize).min(z.len())..],
+                &mut out,
+                FlushDecompress::None,
+            )
+            .map_err(|_| NetError::Inflate)?;
+        if out.len() as u64 > MAX_INFLATED {
+            return Err(NetError::Inflate);
+        }
+        match status {
+            Status::StreamEnd => return Ok(out),
+            // No progress with input left or exhausted: truncated stream.
+            _ if d.total_in() == in0 && out.len() == out0 && out.capacity() > out.len() => {
+                return Err(NetError::Inflate)
+            }
+            _ => {}
+        }
     }
-    Ok(out)
 }
 
 /// Smoothed round-trip time estimate (RFC 6298 constants, RTO floor 50 ms).
@@ -555,6 +647,87 @@ mod tests {
             res = r.push(f);
         }
         assert_eq!(res, Err(NetError::Inflate));
+    }
+
+    /// The previous implementation (a fresh streaming encoder per message),
+    /// kept as the oracle for the reusable one.
+    fn oracle_compress(message: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(message).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn oracle_inflate(z: &[u8]) -> Result<Vec<u8>, ()> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::ZlibDecoder::new(z)
+            .take(MAX_INFLATED + 1)
+            .read_to_end(&mut out)
+            .map_err(|_| ())?;
+        if out.len() as u64 > MAX_INFLATED {
+            return Err(());
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn reused_deflater_matches_fresh_encoder_byte_for_byte() {
+        let mut d = Deflater::new();
+        let mut s = 99u64;
+        // sizes around block, window and fragment boundaries; text and noise
+        for (k, len) in [
+            0usize, 1, 2, 30, 100, 1213, 1214, 1215, 4096, 16384, 32768, 32769, 65536, 100_000,
+            300_000,
+        ]
+        .into_iter()
+        .cycle()
+        .take(45)
+        .enumerate()
+        {
+            let msg: Vec<u8> = (0..len)
+                .map(|i| match k % 3 {
+                    0 => lcg(&mut s),
+                    1 => b"abc def \x1b[31m"[i % 13],
+                    _ => (lcg(&mut s) & 0x0f) + b'a',
+                })
+                .collect();
+            let z = oracle_compress(&msg);
+            let frags = d.fragment(7, &msg).unwrap();
+            let joined: Vec<u8> = frags.iter().flat_map(|f| f.data.iter().copied()).collect();
+            assert_eq!(joined, z, "len {len} kind {}", k % 3);
+            assert_eq!(fragment(7, &msg).unwrap(), frags);
+        }
+    }
+
+    #[test]
+    fn inflate_matches_streaming_decoder_on_good_truncated_and_corrupt_input() {
+        let mut r = Reassembler::new();
+        let mut s = 5u64;
+        for len in [0usize, 10, 1000, 50_000, 200_000] {
+            let msg: Vec<u8> = (0..len).map(|_| lcg(&mut s) & 0x3f).collect();
+            let z = oracle_compress(&msg);
+            let mut cases: Vec<Vec<u8>> = vec![
+                z.clone(),
+                z[..z.len() / 2].to_vec(),
+                z[..z.len() - 1].to_vec(),
+            ];
+            let mut bad = z.clone();
+            if bad.len() > 10 {
+                let mid = bad.len() / 2;
+                bad[mid] ^= 0x55;
+            }
+            cases.push(bad);
+            cases.push([z.as_slice(), b"trailing"].concat());
+            for c in cases {
+                assert_eq!(
+                    inflate(&mut r.z, &c).ok(),
+                    oracle_inflate(&c).ok(),
+                    "len {len}, input {} B",
+                    c.len()
+                );
+            }
+        }
     }
 
     #[test]

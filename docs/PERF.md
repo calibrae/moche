@@ -676,3 +676,116 @@ libcrypto, libz, libstdc++, libm, libgcc_s, libc and the loader.)
 (Condensed from the generated `report.md`: rows that were identical in both clients, the all-zero
 user/sys tick rows of the short scenarios and the dynamic-library address listing are omitted; the raw
 `runs/*.json` and the full report stay in the VM lab output directory.)
+
+
+## CPU optimisation log
+
+Measured 2026-11-04 on the Mac (M1, macOS 26.4, stock mosh-server 1.4.0 on loopback), 3 runs per
+scenario, medians; baseline is HEAD b26ebe8 built the same way. Every optimisation below is
+wire-neutral and proven so by `tools/perf/golden-diff.sh [REF]`: it runs the deterministic scenario
+`crates/moche-core/examples/golden.rs` (300 typed keys, a 150 KB lossy paste with 12 % loss, 40 KB
+more, a resize, heartbeats, a 71-fragment server repaint, 120 VT fuzz cases) on REF and on the working
+tree and requires the output to be byte-identical: the sealed bytes of all 1561 datagrams with their
+emission time, every `next_deadline_ms` change, decoded events, host paints and VT hashes. Result:
+IDENTICAL. Bench: `cargo run --release -p moche-ffi --example bench` (ns/op, allocs/op);
+allocation sites: `... --example allocsites` (a counting allocator in moche-ffi, the only crate
+allowed `unsafe`).
+
+### Where the CPU went (before)
+
+- Typing (30 s, 300 keys): 0.143 s CPU, user 0.065 / sys 0.077, 223 M instructions; sys dominates.
+  Per key (instrumented copy of the CLI, not committed): 4.5 poll, 1 read(stdin), 4.2 recvfrom (half
+  EAGAIN), 1.4 sendto, 1.8 write(tty), **4.5 ioctl(TIOCGWINSZ)**, **2.8 read(/dev/urandom)**: about 21
+  syscalls and 4.5 wakeups per key. `sample` showed time in the ioctl/sendto/recvfrom/madvise
+  syscalls and in large `malloc`/`madvise`; user-side hot spots were deflate/inflate state setup and
+  framebuffer clones.
+- Allocations per event (counting allocator, 80x24): outgoing datagram 7 allocations >= 4 KiB
+  (65 712, 85 196, 4 320, 33 026, 65 536, 65 536, 32 768 B: the miniz compressor state built for each
+  datagram); incoming frame 4 (32 768 + 43 296: the inflate state; 61 440 x 2: `Screen::apply`
+  clone and the display's `shown` clone, 384 000 x 2 at 200x60). These match the sizes the Linux
+  strace shows.
+- Micro-benchmarks before: compress of a keystroke instruction 6.3 us and 352 KB allocated; heartbeat
+  frame 7.2 us / 352 KB; small server frame `handle_datagram` 3.1 us / 77 KB; `Screen::apply` 80x24
+  3.0 us / 61 KB, 200x60 19 us / 384 KB, 400x120 80 us / 1.5 MB.
+
+### Implemented
+
+| change | effect (measured) |
+|---|---|
+| `network::Deflater` held by the Transport; `Compress::reset` instead of a new encoder per datagram (same bytes: unit test vs a fresh streaming encoder on 45 inputs up to 300 KB) | keystroke/heartbeat frame 352 KB -> 0.9 KB allocated, 0 allocations >= 4 KiB; time unchanged (reset still clears the tables, 5-6 us) |
+| `Reassembler` keeps a `Decompress`; single-fragment messages skip the group map and the copy (unit test vs the old `ZlibDecoder` on good, truncated, corrupt and trailing-garbage input) | small server frame 3.1 us -> 1.0 us, 77 KB -> 1 KB |
+| `Transport::receive` returns the sequence number and events; FFI `Core::datagram` used to open every datagram twice | one OCB3 open (about 0.24 us / 100 B, 2.9 us / 1252 B) saved per received datagram; FFI path only |
+| `Screen` states are `Arc<Framebuffer>`; an empty diff (echo-ack, ack) shares the base instead of copying; `latest_shared()`; the display/FFI keep the painted state as an `Arc` | no copy for the 2nd server frame per key; no `shown` clone |
+| `Screen` recycles discarded grids (`Framebuffer::clone_from`, at most 2 spare) | `Screen::apply` 80x24 3.0 -> 2.2 us, 200x60 19 -> 13.7 us, 400x120 80 -> 57 us; 61 KB -> 0.4 KB allocated; **steady state: 0 allocations >= 1 KiB for a server frame, an echo-ack frame, a keystroke frame and an ack frame, at 80x24 and 200x60** |
+| CLI: paint skipped when the screen shown is unchanged (`ptr_eq` / `display_eq`) | about 0.8 tty write per key |
+| CLI: window size read only after a self-pipe wake (SIGWINCH), not on every loop turn | 4.5 ioctl per key -> 0 |
+| CLI: `/dev/urandom` through a 512 B `BufReader` (2 reads per frame before) | 2.8 read per key -> about 0.1 |
+| VT: printable-ASCII fast path in the ground state | within noise (5.4 -> 5.1 ms per 100 KB); kept, verified by the VT fuzz in the golden run |
+
+### Before / after on the Mac (medians of 3)
+
+| scenario | metric | before | after | change |
+|---|---|---:|---:|---:|
+| typing 30 s | CPU user + sys (s) | 0.143 (0.065 + 0.077) | 0.112 (0.048 + 0.062) | -22 % |
+| typing 30 s | instructions / cycles (M) | 223 / 239 | 170 / 184 | -24 % / -23 % |
+| typing 30 s | peak RSS (KB) | 3232 | 2704 | |
+| paste 1 MiB | CPU (s) | 0.051 | 0.052 | none (bound by VT scrolling and zlib) |
+| idle 60 s | CPU (s) | 0.013 | 0.008 | -38 % |
+| idle 60 s | instructions (M) | 14 | 6 | -57 % |
+
+Measured spread is 0.102-0.114 s for typing after against 0.140-0.152 before; datagram counts
+vary 385-469 per run in both and are not affected by these changes. On macOS the system malloc
+caches big blocks, so the allocation fix shows up as fewer instructions, not page faults; the
+Linux/musl effect (mmap + munmap + page faults per block) is not measurable here.
+
+### Not done / not found
+
+- The per-byte VT cost is dominated by scrolling: `rotate_left` of the whole grid per line feed
+  (about 3 us at 80x24, 17 us at 200x60, 1.4 ns per cell). A row-indirection (a permutation vector
+  of row indices) would make a scroll O(1); not done (touches about 15 sites in `vt.rs`, no
+  effect on typing). Paste is already 0.15x stock CPU.
+- Re-compressing a resent state (cache) is not wire-neutral: each resend draws fresh chaff, and the
+  chaff is inside the compressed message. Proposal: compress the diff once per state and append the
+  chaff outside the deflate stream (needs a stock-server check). Only helps lossy links (16 KiB
+  resend 206 us).
+- Wakeups (4.5 per key) and per-datagram syscalls are set by the protocol timing (8 ms collection,
+  100 ms ack delay, server frames 12 and 60 ms after a key). The datagram pattern per key is the
+  same for the stock client (1.0-1.3 client datagrams per key through a loopback relay, 2.2 server
+  datagrams per key for both).
+
+### Proposals (not implemented: they change what or when we send)
+
+1. Ack delay 100 -> about 108-110 ms. Observed in isolated-key traces: moche's standalone ack leaves
+   104-108 ms after the first server frame, stock's 111-115 ms. At 10 keys/s plus tmux jitter the next
+   keystroke lands at 108-128 ms, so the 100 ms timer fires first and costs a datagram, a wake and
+   a poll: moche 1.45-1.56 client datagrams per key against 1.29 for stock through the relay (macOS
+   loopback only; on Linux the counts are equal, so low value there). Expected: -0.2 datagram, -1 wake
+   and about -8 syscalls per key on macOS. Risk: the server's retransmission of its own frame if the
+   ack is late (stays far below its resend interval at RTT 1-50 ms; not tested at high RTT). Lab test:
+   relay or tcpdump typing at 10 and 5 keys/s at RTT 1, 50, 200 ms, 3 values (100, 108, 116),
+   counting client datagrams per key and server frames with no effect (duplicates). My A/B attempt on
+   loopback was inside the noise (+-0.3 per key), so this is a hypothesis.
+2. Chaff only in the first send of a state, or none. Saves 2 RNG draws per frame and about 8 B; the
+   stock server never needed it? Untested (protocol.md U12). Negligible CPU; skip unless a test shows
+   the server accepts chaffless frames.
+3. A musl-friendly allocator (mimalloc or rpmalloc, both MIT, built from C by `cc`; with the zig
+   cross toolchain it needs the C source compiled for `aarch64-linux-musl` and adds a few hundred KB
+   to the 0.63 MB binary: unverified here, no new dependency was added). Not needed after the fix
+   above: the steady state allocates nothing over 1 KiB, so there is nothing left for musl to
+   mmap. If a Linux strace still shows mappings, a tiny arena for the three per-frame buffers (the
+   two grids, the compressor) is simpler than a global allocator; try that first.
+
+### Linux re-check (to run in the lab VM)
+
+Build the musl release from this tree (`tools/release/build.sh` as in docs/RELEASING.md), copy the
+binary to moche-b, then:
+
+```sh
+cd perf && ./measure.sh --label linux-aarch64-vm-opt --moche /path/to/moche \
+    --server-ssh <user>@<a-u2-ip> --server-host <a-u2-ip> --scenarios typing,idle --reps 3
+# page faults and mappings per keystroke (expect no mmap/munmap per key, minor faults near stock's):
+strace -f -c -p $(pgrep -x moche) -e trace=mmap,munmap,brk,mprotect   # type 100 keys, then Ctrl-C
+```
+
+Compare typing CPU (was 0.494 s), minor page faults (58 325) and idle CPU (0.027 s) with the
+numbers in the Linux section; a good result is typing near 0.2 s and a few thousand faults.

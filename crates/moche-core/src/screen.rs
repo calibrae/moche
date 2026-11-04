@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 pub use crate::vt::{flag, Attrs, Cell, Color, Framebuffer, Modes, ScreenEvent, MAX_DIM};
 
@@ -33,10 +34,15 @@ impl std::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
+/// Recycled framebuffers kept at most (a state copy needs one).
+const MAX_SPARE: usize = 2;
+
 /// Numbered framebuffer states.
 #[derive(Clone, Debug)]
 pub struct Screen {
-    states: BTreeMap<u64, Framebuffer>,
+    states: BTreeMap<u64, Arc<Framebuffer>>,
+    /// Discarded states kept for reuse as the target of the next copy.
+    spare: Vec<Framebuffer>,
     events: Vec<ScreenEvent>,
 }
 
@@ -44,9 +50,10 @@ impl Screen {
     /// State 0 is a blank `cols` x `rows` screen.
     pub fn new(cols: u16, rows: u16) -> Self {
         let mut states = BTreeMap::new();
-        states.insert(0, Framebuffer::new(cols, rows));
+        states.insert(0, Arc::new(Framebuffer::new(cols, rows)));
         Screen {
             states,
+            spare: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -71,25 +78,52 @@ impl Screen {
         if self.states.contains_key(&new_num) {
             return Ok(());
         }
-        let mut fb = self
+        let base = self
             .states
             .get(&old_num)
-            .ok_or(ApplyError::BaseMissing(old_num))?
-            .clone();
+            .ok_or(ApplyError::BaseMissing(old_num))?;
+        if resize.is_none() && bytes.is_empty() {
+            // Nothing changes (an ack-only or echo-ack-only frame): the new state
+            // is the base itself, shared instead of copied.
+            let same = Arc::clone(base);
+            self.states.insert(new_num, same);
+            return Ok(());
+        }
+        let mut fb = match self.spare.pop() {
+            Some(mut buf) => {
+                buf.clone_from(base);
+                buf
+            }
+            None => Framebuffer::clone(base),
+        };
         if let Some((c, r)) = resize {
             fb.resize(c, r);
         }
         fb.feed(bytes);
         self.events.extend(fb.take_events());
-        self.states.insert(new_num, fb);
+        self.states.insert(new_num, Arc::new(fb));
         Ok(())
     }
 
     /// Drops states numbered below `throwaway_num`; the latest state is always kept.
     pub fn discard_below(&mut self, throwaway_num: u64) {
         let latest = self.latest_num();
-        self.states
-            .retain(|&n, _| n >= throwaway_num || n == latest);
+        let dead: Vec<u64> = self
+            .states
+            .keys()
+            .copied()
+            .filter(|&n| n < throwaway_num && n != latest)
+            .collect();
+        for n in dead {
+            if let Some(a) = self.states.remove(&n) {
+                // Sole owner (no host copy of it): recycle the grid.
+                if let Ok(fb) = Arc::try_unwrap(a) {
+                    if self.spare.len() < MAX_SPARE {
+                        self.spare.push(fb);
+                    }
+                }
+            }
+        }
     }
 
     /// Highest state number held.
@@ -106,6 +140,17 @@ impl Screen {
             .expect("screen always holds a state")
     }
 
+    /// The highest state, shared: a host keeps it as "what the terminal shows"
+    /// without copying the grid.
+    pub fn latest_shared(&self) -> Arc<Framebuffer> {
+        Arc::clone(
+            self.states
+                .values()
+                .next_back()
+                .expect("screen always holds a state"),
+        )
+    }
+
     /// True if state `num` is held.
     pub fn has_state(&self, num: u64) -> bool {
         self.states.contains_key(&num)
@@ -113,7 +158,7 @@ impl Screen {
 
     /// A held state, if any.
     pub fn state(&self, num: u64) -> Option<&Framebuffer> {
-        self.states.get(&num)
+        self.states.get(&num).map(|a| &**a)
     }
 
     /// Numbers of held states, ascending.

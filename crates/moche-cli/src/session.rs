@@ -95,7 +95,10 @@ fn wait_ms(now: u64, transport_deadline: Option<u64>, status_tick: Option<u64>) 
 }
 
 fn urandom() -> Result<Rng, String> {
-    let mut f = File::open("/dev/urandom").map_err(|e| format!("cannot open /dev/urandom: {e}"))?;
+    // Buffered: each frame draws 1 + 0..=16 chaff bytes, which would be two
+    // read(2) calls per datagram unbuffered.
+    let f = File::open("/dev/urandom").map_err(|e| format!("cannot open /dev/urandom: {e}"))?;
+    let mut f = std::io::BufReader::with_capacity(512, f);
     Ok(Box::new(move |buf: &mut [u8]| {
         if f.read_exact(buf).is_err() {
             // Chaff needs no secrecy: degrade to zeros rather than fail.
@@ -198,7 +201,10 @@ fn event_loop(
         }
         let stdin_ev = fds[0].revents();
         let sock_ev = fds[1].revents();
-        if !fds[2].revents().is_empty() {
+        // SIGWINCH, SIGTERM and SIGHUP write the self-pipe: only then can the
+        // window size have changed, so only then is it queried (an ioctl).
+        let signalled = !fds[2].revents().is_empty();
+        if signalled {
             signals.drain();
         }
 
@@ -252,11 +258,13 @@ fn event_loop(
             return Ok(Outcome::Shutdown);
         }
 
-        let size = term::size();
-        if size != (cols, rows) {
-            (cols, rows) = size;
-            transport.send_resize(now(), cols, rows);
-            display.on_local_resize();
+        if signalled {
+            let size = term::size();
+            if size != (cols, rows) {
+                (cols, rows) = size;
+                transport.send_resize(now(), cols, rows);
+                display.on_local_resize();
+            }
         }
 
         let out = display.flush();

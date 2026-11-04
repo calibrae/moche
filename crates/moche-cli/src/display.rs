@@ -5,6 +5,8 @@
 //! `moche_core::screen::Screen` and paints minimal diffs. [`Passthrough`]
 //! (hidden `--passthrough`) writes host diffs straight out, for debugging.
 
+use std::sync::Arc;
+
 use moche_core::screen::{Framebuffer, Screen, ScreenEvent};
 
 /// Consumes events from the transport, produces bytes for the tty.
@@ -52,7 +54,7 @@ impl Display for Passthrough {
 pub struct ScreenDisplay {
     screen: Screen,
     /// What the terminal currently shows; `None` forces a full repaint.
-    shown: Option<Framebuffer>,
+    shown: Option<Arc<Framebuffer>>,
     dirty: bool,
     bell: bool,
     desync: bool,
@@ -102,8 +104,17 @@ impl Display for ScreenDisplay {
     fn flush(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         if std::mem::take(&mut self.dirty) {
-            out = self.screen.repaint(self.shown.as_ref());
-            self.shown = Some(self.screen.latest().clone());
+            let latest = self.screen.latest_shared();
+            // A frame that changes nothing the terminal shows (echo-ack, ack)
+            // costs no tty write.
+            let same = self
+                .shown
+                .as_ref()
+                .is_some_and(|p| Arc::ptr_eq(p, &latest) || p.display_eq(&latest));
+            if !same {
+                out = self.screen.repaint(self.shown.as_deref());
+            }
+            self.shown = Some(latest);
         }
         if std::mem::take(&mut self.bell) {
             out.push(0x07);

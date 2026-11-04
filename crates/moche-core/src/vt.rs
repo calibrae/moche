@@ -210,7 +210,7 @@ impl Parser {
 }
 
 /// A terminal screen: cell grid, cursor, modes, title.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Framebuffer {
     cols: usize,
     rows: usize,
@@ -233,6 +233,60 @@ pub struct Framebuffer {
     join_pending: bool,
     parser: Parser,
     events: Vec<ScreenEvent>,
+}
+
+impl Clone for Framebuffer {
+    fn clone(&self) -> Self {
+        Framebuffer {
+            cols: self.cols,
+            rows: self.rows,
+            cells: self.cells.clone(),
+            row: self.row,
+            col: self.col,
+            pending_wrap: self.pending_wrap,
+            cursor_visible: self.cursor_visible,
+            pen: self.pen,
+            saved: self.saved.clone(),
+            top: self.top,
+            bottom: self.bottom,
+            tabs: self.tabs.clone(),
+            modes: self.modes,
+            alt: self.alt.clone(),
+            title: self.title.clone(),
+            icon_name: self.icon_name.clone(),
+            last_char: self.last_char,
+            join_pending: self.join_pending,
+            parser: self.parser.clone(),
+            events: self.events.clone(),
+        }
+    }
+
+    /// Copies `src` into `self` reusing the grid's allocation: a recycled
+    /// buffer makes a state copy a memcpy instead of a malloc of the whole
+    /// screen (which, above the allocator's mmap threshold, is an mmap, page
+    /// faults and an munmap per copy).
+    fn clone_from(&mut self, src: &Self) {
+        self.cols = src.cols;
+        self.rows = src.rows;
+        self.cells.clone_from(&src.cells);
+        self.row = src.row;
+        self.col = src.col;
+        self.pending_wrap = src.pending_wrap;
+        self.cursor_visible = src.cursor_visible;
+        self.pen = src.pen;
+        self.saved.clone_from(&src.saved);
+        self.top = src.top;
+        self.bottom = src.bottom;
+        self.tabs.clone_from(&src.tabs);
+        self.modes = src.modes;
+        self.alt.clone_from(&src.alt);
+        self.title.clone_from(&src.title);
+        self.icon_name.clone_from(&src.icon_name);
+        self.last_char = src.last_char;
+        self.join_pending = src.join_pending;
+        self.parser = src.parser.clone();
+        self.events.clone_from(&src.events);
+    }
 }
 
 fn clamp_dim(v: u16) -> usize {
@@ -422,7 +476,7 @@ impl Framebuffer {
         match self.parser.state {
             State::Ground => match b {
                 0x00..=0x1f => self.control(b),
-                0x20..=0x7e => self.print(char::from(b)),
+                0x20..=0x7e => self.print_ascii(b),
                 0x7f => {}
                 0x80..=0xff => {
                     let need = match b {
@@ -1137,6 +1191,41 @@ impl Framebuffer {
         s.push(ch);
         cell.comb = Some(s.into_boxed_str());
         self.join_pending = ch == ZWJ;
+    }
+
+    /// `print` for a printable ASCII byte: width 1 by definition, so no width
+    /// lookup and none of the wide/combining handling. A pending ZWJ join takes
+    /// the general path.
+    fn print_ascii(&mut self, b: u8) {
+        if self.join_pending {
+            self.print(char::from(b));
+            return;
+        }
+        self.last_char = Some(char::from(b));
+        if self.pending_wrap {
+            self.pending_wrap = false;
+            if self.modes.autowrap {
+                self.col = 0;
+                self.index();
+            }
+        }
+        let (row, col) = (self.row, self.col);
+        let base = row * self.cols + col;
+        if (col > 0 && self.cells[base].width == 0)
+            || (col + 1 < self.cols && self.cells[base + 1].width == 0)
+        {
+            self.clear_wide_edges(row, col, col + 1);
+        }
+        let cell = &mut self.cells[base];
+        cell.ch = char::from(b);
+        cell.width = 1;
+        cell.attrs = self.pen;
+        cell.comb = None;
+        self.col += 1;
+        if self.col >= self.cols {
+            self.col = self.cols - 1;
+            self.pending_wrap = self.modes.autowrap;
+        }
     }
 
     fn print(&mut self, ch: char) {
