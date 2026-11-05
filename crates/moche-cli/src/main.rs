@@ -6,6 +6,7 @@ mod display;
 mod session;
 mod status;
 mod term;
+mod trace;
 
 use std::io::BufRead;
 use std::os::unix::net::UnixStream;

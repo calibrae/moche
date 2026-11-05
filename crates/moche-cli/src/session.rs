@@ -19,6 +19,7 @@ use crate::status::{
     clear_status, draw_status, next_status_tick_ms, ExitKey, Status, StatusUpdate,
 };
 use crate::term;
+use crate::trace;
 
 /// Longest sleep between polls when nothing else bounds it.
 const MAX_WAIT_MS: u64 = 5000;
@@ -143,6 +144,17 @@ pub fn run(
     result
 }
 
+/// `term::write_tty`, timed when the predict trace is on.
+fn write_tty_traced(out: &[u8]) {
+    if trace::on() {
+        let t0 = trace::now();
+        term::write_tty(out);
+        trace::tty_write(out.len(), t0, trace::now());
+    } else {
+        term::write_tty(out);
+    }
+}
+
 fn event_loop(
     transport: &mut Transport,
     start: Instant,
@@ -177,6 +189,9 @@ fn event_loop(
             if socket.send_to(&d, server).is_ok() {
                 stats.datagrams_sent += 1;
                 stats.bytes_sent += d.len() as u64;
+                if trace::on() {
+                    trace::log(format_args!("tx bytes={}", d.len()));
+                }
             }
         }
 
@@ -195,9 +210,18 @@ fn event_loop(
             PollFd::new(socket, PollFlags::IN),
             PollFd::new(&signals.wake, PollFlags::IN),
         ];
+        let p0 = trace::on().then(trace::now);
         match poll(&mut fds, Some(&timeout)) {
             Ok(_) | Err(Errno::INTR) => {}
             Err(e) => return Err(format!("poll: {e}")),
+        }
+        if let Some(p0) = p0 {
+            // a poll that came back with nothing ready, well after its timeout: the process
+            // was descheduled or its timer was coalesced by the OS (not a moche delay)
+            let late = (trace::now() - p0) * 1000.0 - wait as f64;
+            if late > 20.0 && fds.iter().all(|f| f.revents().is_empty()) {
+                trace::log(format_args!("poll_late wait={wait} late_ms={late:.1}"));
+            }
         }
         let stdin_ev = fds[0].revents();
         let sock_ev = fds[1].revents();
@@ -266,7 +290,7 @@ fn event_loop(
 
         let out = display.flush();
         if !out.is_empty() {
-            term::write_tty(&out);
+            write_tty_traced(&out);
         }
         if shutdown {
             return Ok(Outcome::Shutdown);
@@ -283,7 +307,7 @@ fn event_loop(
 
         let out = display.flush();
         if !out.is_empty() {
-            term::write_tty(&out);
+            write_tty_traced(&out);
             // The repaint may have covered the status row.
             if let Some(t) = status.shown() {
                 term::write_tty(&draw_status(t, cols, rows));

@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use moche_core::predict::{PredictMode, Predictor};
+use moche_core::predict::{PredictDebug, PredictMode, PredictStats, Predictor};
+use moche_core::vt::flag;
+
+use crate::trace;
 use moche_core::screen::{repaint, Framebuffer, Screen, ScreenEvent};
 
 /// Consumes events from the transport, produces bytes for the tty.
@@ -96,6 +99,104 @@ pub struct ScreenDisplay {
     dirty: bool,
     bell: bool,
     desync: bool,
+    /// Predict trace bookkeeping (only touched when `MOCHE_PREDICT_TRACE` is set).
+    tr: TraceState,
+}
+
+/// What the previous trace hook saw, to log only the changes.
+#[derive(Default)]
+struct TraceState {
+    stats: PredictStats,
+    dbg: Option<PredictDebug>,
+    epoch: u64,
+}
+
+impl TraceState {
+    /// Logs what changed in the predictor since the last hook; `ev` names the hook.
+    fn after(&mut self, ev: &str, p: &Predictor) {
+        let d = p.debug_state();
+        let s = p.stats();
+        let o = self.dbg.unwrap_or(d);
+        if d.barrier != o.barrier || s.mismatches != self.stats.mismatches {
+            self.epoch += 1;
+        }
+        if d.adaptive_on != o.adaptive_on || d.flag_on != o.flag_on {
+            trace::log(format_args!(
+                "hysteresis adaptive_on={} flag_on={} srtt={:.1}",
+                d.adaptive_on as u8, d.flag_on as u8, d.srtt_ms
+            ));
+        }
+        if s.confirmed != self.stats.confirmed {
+            trace::log(format_args!(
+                "confirmed n={} streak={} tentative={}",
+                s.confirmed - self.stats.confirmed,
+                d.streak,
+                d.tentative as u8
+            ));
+        }
+        if s.mismatches != self.stats.mismatches {
+            trace::log(format_args!("contradicted tentative={}", d.tentative as u8));
+        }
+        if s.expired != self.stats.expired {
+            trace::log(format_args!("expired"));
+        }
+        if d.frozen != o.frozen {
+            trace::log(format_args!("frozen={}", d.frozen as u8));
+        }
+        trace::log(format_args!(
+            "state after={ev} epoch={} gate={} tentative={} streak={} pending={} frozen={} \
+             adaptive_on={} flag_on={} srtt={:.1} echoed={} barrier={}",
+            self.epoch,
+            d.gate_open as u8,
+            d.tentative as u8,
+            d.streak,
+            d.pending,
+            d.frozen as u8,
+            d.adaptive_on as u8,
+            d.flag_on as u8,
+            d.srtt_ms,
+            d.echoed,
+            d.barrier
+        ));
+        self.stats = s;
+        self.dbg = Some(d);
+    }
+}
+
+/// Logs the cells of `shown` that differ from the server's `latest` (the overlay).
+fn trace_overlay(shown: &Framebuffer, latest: &Framebuffer, epoch: u64, bytes: usize) {
+    let mut cells = String::new();
+    let mut n = 0;
+    for r in 0..shown.rows().min(latest.rows()) {
+        for c in 0..shown.cols().min(latest.cols()) {
+            let (a, b) = (shown.cell(r, c), latest.cell(r, c));
+            if a.ch != b.ch || a.attrs.flags != b.attrs.flags {
+                n += 1;
+                cells.push_str(&format!(
+                    " [{r},{c} shown={:?}{} server={:?}{}]",
+                    a.ch,
+                    if a.attrs.flags & flag::UNDERLINE != 0 {
+                        "_"
+                    } else {
+                        ""
+                    },
+                    b.ch,
+                    if b.attrs.flags & flag::UNDERLINE != 0 {
+                        "_"
+                    } else {
+                        ""
+                    },
+                ));
+            }
+        }
+    }
+    trace::log(format_args!(
+        "paint overlay_cells={n} epoch={epoch} cursor={},{} server_cursor={},{} diff_bytes={bytes}{cells}",
+        shown.cursor_row(),
+        shown.cursor_col(),
+        latest.cursor_row(),
+        latest.cursor_col()
+    ));
 }
 
 impl ScreenDisplay {
@@ -108,6 +209,7 @@ impl ScreenDisplay {
             dirty: true,
             bell: false,
             desync: false,
+            tr: TraceState::default(),
         }
     }
 
@@ -129,6 +231,16 @@ impl Display for ScreenDisplay {
             // is held (and never acks one it did not deliver), so this should
             // not trigger with a sane server. Flag it for the status line.
             Err(_) => self.desync = true,
+        }
+        if trace::on() {
+            let l = self.screen.latest();
+            trace::log(format_args!(
+                "server_diff old={old} new={new} bytes={} cursor={},{} row={:?}",
+                bytes.len(),
+                l.cursor_row(),
+                l.cursor_col(),
+                l.row_text(l.cursor_row())
+            ));
         }
         for ev in self.screen.take_events() {
             // Titles are painted by repaint.
@@ -153,16 +265,30 @@ impl Display for ScreenDisplay {
             self.predictor
                 .on_input(now_ms, keys, self.screen.latest(), srtt_ms, input_total);
         self.dirty |= changed;
+        if trace::on() {
+            trace::log(format_args!(
+                "on_input bytes={} predicted={}",
+                hex(keys),
+                self.predictor.stats().predicted - self.tr.stats.predicted
+            ));
+            self.tr.after("input", &self.predictor);
+        }
     }
     fn on_progress(&mut self, echoed: u64, now_ms: u64) {
         let changed = self
             .predictor
             .on_server_state(self.screen.latest(), echoed, now_ms);
         self.dirty |= changed;
+        if trace::on() {
+            self.tr.after("progress", &self.predictor);
+        }
     }
     fn tick(&mut self, now_ms: u64, srtt_ms: f64, silent_ms: u64) {
         let changed = self.predictor.tick(now_ms, srtt_ms, silent_ms);
         self.dirty |= changed;
+        if trace::on() && changed {
+            self.tr.after("tick", &self.predictor);
+        }
     }
     fn next_deadline_ms(&self) -> Option<u64> {
         self.predictor.next_deadline_ms()
@@ -184,6 +310,9 @@ impl Display for ScreenDisplay {
                 let same = self.painted.get().is_some_and(|p| p.display_eq(&buf));
                 if !same {
                     out = repaint(&buf, self.painted.get());
+                    if trace::on() {
+                        trace_overlay(&buf, &latest, self.tr.epoch, out.len());
+                    }
                 }
                 self.set_painted(Painted::Overlay(buf));
             } else {
@@ -210,6 +339,10 @@ impl Display for ScreenDisplay {
         self.dirty = true;
         self.flush()
     }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Picks the display implementation.

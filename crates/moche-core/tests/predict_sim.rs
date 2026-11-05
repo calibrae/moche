@@ -214,6 +214,16 @@ struct Sim {
     seq: u64,
     /// Steps at which the composite differed from the server state.
     visible_steps: u64,
+    /// Records what each visible step showed (see `Sim::ghosts`); `SIMTRACE=1` also prints it.
+    watch: bool,
+    seen: Vec<Seen>,
+}
+
+/// One visible step: the first display row, and whether predictions were pending.
+struct Seen {
+    at: u64,
+    row: String,
+    pending: usize,
 }
 
 impl Sim {
@@ -240,6 +250,8 @@ impl Sim {
             events: Vec::new(),
             seq: 0,
             visible_steps: 0,
+            watch: false,
+            seen: Vec::new(),
         };
         // the initial prompt reaches the client before the scenario starts
         s.screen.apply(0, 1, None, PROMPT.as_bytes()).unwrap();
@@ -352,6 +364,23 @@ impl Sim {
             }
             if !self.composite().display_eq(self.screen.latest()) {
                 self.visible_steps += 1;
+                if self.watch {
+                    let c = self.composite();
+                    let d = self.pred.debug_state();
+                    if std::env::var("SIMTRACE").is_ok() {
+                        eprintln!(
+                            "t={} shown={:?} srv={:?} {d:?}",
+                            self.now,
+                            c.row_text(0),
+                            self.screen.latest().row_text(0)
+                        );
+                    }
+                    self.seen.push(Seen {
+                        at: self.now,
+                        row: c.row_text(0).trim_end().to_string(),
+                        pending: d.pending,
+                    });
+                }
             }
         }
     }
@@ -380,6 +409,35 @@ impl Sim {
         self.send_instruction(None, true);
         let t2 = self.now + self.net.down_ms + self.net.jitter_ms + 1;
         self.run_until(t2);
+    }
+
+    /// Typed characters that were displayed but never existed on the server: for every watched
+    /// visible step, the part of the first row beyond its longest common prefix with the
+    /// server's FINAL row. Returns (steps with at least one such character, the most shown at
+    /// once, first and last ms). A character the server did echo (the display only led it) is
+    /// not a ghost; a predicted backspace/arrow leaves no extra character either.
+    fn ghosts(&self) -> (u64, usize, u64, u64) {
+        let fin = self.server_fb.row_text(0);
+        let fin = fin.trim_end();
+        let (mut steps, mut most, mut first, mut last) = (0, 0, 0, 0);
+        for st in &self.seen {
+            let common = st
+                .row
+                .chars()
+                .zip(fin.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let extra = st.row.chars().count() - common;
+            if extra > 0 {
+                if steps == 0 {
+                    first = st.at;
+                }
+                steps += 1;
+                most = most.max(extra);
+                last = st.at;
+            }
+        }
+        (steps, most, first, last)
     }
 
     fn assert_converged(&self, what: &str) {
@@ -751,4 +809,176 @@ fn property_converges_without_residue_or_panic() {
     // the run must actually exercise every path
     assert!(agg.predicted > 500 && agg.confirmed > 200, "{agg:?}");
     assert!(agg.mismatches > 20 && agg.expired > 0, "{agg:?}");
+}
+
+// ---- ghost-secret scenarios (round 11): what may and what may not show at a prompt that
+// stops echoing. `visible_steps` counts the ms at which the display differed from the
+// server's own state. ----
+
+/// A long stall makes the smoothed RTT spike: adaptive turns on right before a password is
+/// typed. The first key of the epoch is hidden until the server echoes it, so nothing shows.
+#[test]
+fn srtt_stall_then_password_shows_nothing() {
+    let mut s = Sim::new(PredictMode::Adaptive, Beh::Echo, net(5), 21, 80);
+    s.srtt = 10.0;
+    let _ = type_str(&mut s, "su", 10, 80);
+    s.type_at(300, b"\r");
+    s.run_until(500);
+    s.push(s.now, Ev::Switch(Beh::Password));
+    s.run_until(600);
+    let before = s.visible_steps;
+    s.srtt = 600.0; // the stall: the estimate jumps over the adaptive threshold
+    let _ = type_str(&mut s, "correct horse", 700, 70);
+    s.settle();
+    s.assert_converged("stall then password");
+    assert_eq!(s.visible_steps, before, "a typed char was displayed");
+}
+
+/// Echo goes off before the first secret key reaches the server: nothing is ever shown.
+#[test]
+fn echo_off_before_the_first_key_arrives_shows_nothing() {
+    let mut s = Sim::new(PredictMode::Adaptive, Beh::Echo, net(100), 22, 80);
+    s.run_until(300);
+    s.push(s.now + 50, Ev::Switch(Beh::Password)); // before the key below arrives (t=400+100)
+    let before = s.visible_steps;
+    let _ = type_str(&mut s, "secret-pass", 400, 150);
+    s.settle();
+    s.assert_converged("echo off first");
+    assert_eq!(s.visible_steps, before);
+}
+
+/// Echo goes off while the secret is being typed (a host stall delayed `stty -echo`): the
+/// server's REAL echo of the first keys confirms the epoch, the next keys are predicted until
+/// the echo ack contradicts them. That window is the design (the paper's) and is bounded by
+/// one RTT plus the echo window; after the contradiction the connection is tentative.
+#[test]
+fn echo_off_mid_secret_leaks_one_window_at_most() {
+    let mut s = Sim::new(PredictMode::Adaptive, Beh::Echo, net(100), 23, 80);
+    s.run_until(300);
+    // keys at 400 + 150 k arrive at 500 + 150 k; echo off between key 2 and key 3
+    s.push(500 + 150 * 2 + 75, Ev::Switch(Beh::Password));
+    s.watch = true;
+    let _ = type_str(&mut s, "secret-pass", 400, 150);
+    s.settle();
+    s.assert_converged("echo off mid secret");
+    // `visible_steps` also counts the display LEADING the real echo of keys 1-3 (legitimate:
+    // those characters do reach the server), so the leak is measured on characters that never
+    // existed on the server (`ghosts`).
+    let (steps, most, first, last) = s.ghosts();
+    eprintln!(
+        "echo off mid-secret: {steps} ms with a never-echoed char shown ({first}..{last}), at most {most} at once; \
+         overlay of any kind {} ms",
+        s.visible_steps
+    );
+    // By design the first un-echoed key (typed at T) is shown from T until the echo ack that
+    // covers it comes back: one-way up (key reaches the server) + echo window (the ack is
+    // emitted 50 ms later) + one-way down = 250 ms here; +10 ms for the 10 ms tick of the sim
+    // and +1 for the step count. Then the contradiction makes the connection tentative.
+    let window = net(100).up_ms + 50 + net(100).down_ms;
+    assert!(steps <= window + 11, "{steps} ms > window {window}");
+    // keys typed (every 150 ms) while the window is open, the first one included
+    assert!(most as u64 <= window / 150 + 1, "{most} chars at once");
+    assert!(s.pred.stats().mismatches >= 1, "the contradiction was seen");
+}
+
+/// The confirmation of an earlier epoch must not carry over an Enter: the line before the
+/// prompt was echoed and confirmed, the Enter starts a password prompt, the secret is typed
+/// at once. Nothing of the secret shows.
+#[test]
+fn confirmation_does_not_cross_enter_into_a_password_prompt() {
+    for gap in [30u64, 90, 150] {
+        let mut s = Sim::new(PredictMode::Adaptive, Beh::Echo, net(100), 24, 80);
+        let _ = type_str(&mut s, "sudo ls", 10, 60); // echoed and confirmed: gate open
+        s.type_at(600, b"\r");
+        // the Enter (arrives 700) starts the password prompt
+        s.push(701, Ev::Switch(Beh::Password));
+        s.run_until(1100); // the frozen line has gone (ack of the Enter)
+        let before = s.visible_steps;
+        let _ = type_str(&mut s, "hunter2hunter2", 1100, gap);
+        s.settle();
+        s.assert_converged("enter then password");
+        assert_eq!(
+            s.visible_steps, before,
+            "gap {gap}: a typed char was displayed"
+        );
+    }
+}
+
+/// Same, with the secret typed before the Enter's ack is back (the barrier forbids predicting).
+#[test]
+fn secret_typed_right_behind_enter_shows_nothing() {
+    for gap in [5u64, 30, 100] {
+        let mut s = Sim::new(PredictMode::Adaptive, Beh::Echo, net(100), 25, 80);
+        let _ = type_str(&mut s, "sudo ls", 10, 60);
+        s.type_at(600, b"\r");
+        s.push(701, Ev::Switch(Beh::Password));
+        s.run_until(620); // the frozen line is still shown: not counted
+        let _ = type_str(&mut s, "hunter2", 620, gap);
+        s.run_until(1300); // let the frozen line go away
+        let before = s.visible_steps;
+        let _ = type_str(&mut s, "more", 1300, gap);
+        s.settle();
+        s.assert_converged("behind enter");
+        assert_eq!(
+            s.visible_steps, before,
+            "gap {gap}: a typed char was displayed"
+        );
+    }
+}
+
+/// Property: the server never echoes after the point where the prompt is established (echo off
+/// before the first secret key is even typed) -- random timing, srtt spikes, loss, jitter.
+/// Not one overlay cell may ever be displayed for a key typed after that point.
+#[test]
+fn property_no_ghost_when_echo_is_off_before_typing() {
+    for seed in 0..400u64 {
+        let mut r = Lcg(seed * 104729 + 7);
+        let net = Net {
+            up_ms: 2 + r.below(200),
+            down_ms: 2 + r.below(200),
+            jitter_ms: r.below(100),
+            loss_pct: [0, 10, 30][r.below(3) as usize],
+            echo_ms: 50,
+        };
+        let mut s = Sim::new(PredictMode::Adaptive, Beh::Echo, net, seed, 40);
+        s.srtt = [5.0, 15.0, 40.0, 120.0, 800.0][r.below(5) as usize];
+        // an echoed line (maybe), Enter, the prompt switches to no-echo
+        let n = r.below(8) as usize;
+        let line: String = (0..n).map(|_| 'a').collect();
+        let _ = type_str(&mut s, &line, 10, 20 + r.below(100));
+        let t_enter = s.now + 20 + r.below(300);
+        s.type_at(t_enter, b"\r");
+        let sw = t_enter + s.net.up_ms + r.below(30);
+        s.push(sw, Ev::Switch(Beh::Password));
+        // the first secret key is typed only once the switch has certainly happened on the
+        // server (the harness waits for the marker): after the switch plus a full round trip
+        let t0 = sw + s.net.up_ms + s.net.down_ms + s.net.jitter_ms + 120;
+        s.run_until(t0);
+        s.srtt = [5.0, 15.0, 40.0, 120.0, 800.0][r.below(5) as usize];
+        s.watch = true;
+        let mut t = t0;
+        for _ in 0..(5 + r.below(20)) {
+            t += 5 + r.below(250);
+            let k: &[u8] = [&b"s"[..], b"e", b"-", b"\x7f", b"\x1b[D"][r.below(5) as usize];
+            s.type_at(t, k);
+        }
+        s.settle();
+        s.assert_converged(&format!("seed {seed}"));
+        // (i) strict: no typed character is ever displayed (a character the server never had)
+        let (steps, _, first, _) = s.ghosts();
+        assert_eq!(
+            steps, 0,
+            "seed {seed}: a secret char was displayed at {first}"
+        );
+        // (ii) no prediction of ANY kind (also backspace/arrow: blank cell, cursor move) is
+        // ever displayed while a key typed after the prompt is pending: the epoch never had a
+        // confirmation. (Steps with nothing pending are the frozen line of the Enter, shown
+        // until its ack: legitimate, and what the old assertion tripped on.)
+        let shown: Vec<_> = s.seen.iter().filter(|x| x.pending > 0).collect();
+        assert!(
+            shown.is_empty(),
+            "seed {seed}: overlay of a pending prediction at {}",
+            shown[0].at
+        );
+    }
 }

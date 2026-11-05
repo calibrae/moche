@@ -30,7 +30,12 @@ arrives; then the display is reconciled with the server's real state.
    by the server's real echo (SOURCED, paper: "an epoch begins tentatively, making
    predictions only in the background. If any prediction from a certain epoch is
    confirmed by the server, the rest ... are immediately displayed"). A password prompt
-   never confirms, so nothing is shown (Adaptive).
+   never confirms, so nothing is shown (Adaptive). Nothing means nothing: no character, no
+   blank cell and no cursor move either (a predicted backspace or arrow is held back like a
+   character). Checked by `property_no_ghost_when_echo_is_off_before_typing` (400 seeds, loss,
+   jitter, srtt spikes): (i) no character the server never had is displayed, (ii) no overlay of
+   any kind while a key typed after the prompt is pending. The one design exception is a prompt
+   that stops echoing while the secret is already being typed (below).
 4. **Cheap.** `Never` and an inactive Adaptive cost a few ns per call and no allocation
    (`predict_bench`, `docs/PERF.md`). Active: one grid copy per paint (the recycled
    `spare` buffer in `ScreenDisplay`).
@@ -142,11 +147,29 @@ above the flag threshold (an erased cell is an underlined blank, as OBSERVED in 
 - A server that echoes later than the 50 ms echo-ack window gives a false contradiction:
   the display is correct, only the connection goes tentative for two confirmations.
 - `always` leaks for up to one echo window (see Modes).
+- Adaptive, echo switched off in the MIDDLE of a secret (a host stall delayed `stty -echo` after
+  the first keys were really echoed): the real echo of the first keys opened the epoch, so the
+  next key is shown until the echo ack that covers it comes back, then hidden, and the connection
+  is tentative (OUR CHOICE, the paper's design). Bound: one-way up + echo window (50 ms) +
+  one-way down, i.e. 250 ms at 100 ms one way, and the keys typed inside that window (2 at one
+  key per 150 ms). Measured in `echo_off_mid_secret_leaks_one_window_at_most`: 249 ms, 2 chars.
+  The rest of the overlay in that test (500 ms in total) is the display leading the REAL echo of
+  keys that did reach the server: legitimate, not a leak. Not observed in black-box runs of
+  stock (not tried: it needs a host that stalls between the echo and `stty -echo`).
 - The display can differ from the server for at most the timeout (`max(3 s, 4 * srtt)`)
   when no echo ack arrives, and for at most one RTT plus 50 ms otherwise. The host must
   call `tick` at `next_deadline_ms`; the CLI does.
 - Thresholds were observed on loopback with a simulated delay, not on a real path with
   jitter.
+
+## Round 11: ghost-secret forensics
+
+`docs/observations-round11.md`: 650 password checks against a stock server, 0 ghost secrets;
+the two new simulation tests that first failed were test-model errors (the old `visible_steps`
+assertion counted any overlay step, including the display leading a real echo and the frozen
+line of the Enter); `predict.rs` is unchanged. Debug trace: `MOCHE_PREDICT_TRACE=<file>` on
+`moche` (typed keys are written in hex: debugging only), harness in `tests/predict_e2e.py` and
+`tools/perf/predict_e2e_campaign.py`.
 
 ## API for hosts (and the planned FFI)
 

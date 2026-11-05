@@ -78,6 +78,32 @@ impl std::str::FromStr for PredictMode {
     }
 }
 
+/// A read-only snapshot of the internal state, for debug traces (the CLI's
+/// `MOCHE_PREDICT_TRACE`). Reading it changes nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PredictDebug {
+    /// Adaptive hysteresis: predictions are being made.
+    pub adaptive_on: bool,
+    /// The underline threshold is exceeded.
+    pub flag_on: bool,
+    /// The epoch has a confirmed prediction.
+    pub gate_open: bool,
+    /// A contradiction happened and the streak is still short.
+    pub tentative: bool,
+    /// Confirmations since the last contradiction.
+    pub streak: u32,
+    /// Pending (unresolved) predictions.
+    pub pending: usize,
+    /// A frozen overlay (shown at Enter) is still displayed.
+    pub frozen: bool,
+    /// Input bytes the echo ack has covered.
+    pub echoed: u64,
+    /// No prediction until `echoed` reaches this.
+    pub barrier: u64,
+    /// The last smoothed RTT given to the predictor, in ms.
+    pub srtt_ms: f64,
+}
+
 /// Counters, for tests and `--stats`-style reporting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PredictStats {
@@ -343,6 +369,22 @@ impl Predictor {
     /// Counters since creation.
     pub fn stats(&self) -> PredictStats {
         self.stats
+    }
+
+    /// Snapshot of the internal state, for debug traces. No side effect.
+    pub fn debug_state(&self) -> PredictDebug {
+        PredictDebug {
+            adaptive_on: self.adaptive_on,
+            flag_on: self.flag_on,
+            gate_open: self.gate_open,
+            tentative: self.tentative,
+            streak: self.streak,
+            pending: self.pending.len(),
+            frozen: self.frozen.is_some(),
+            echoed: self.echoed,
+            barrier: self.barrier,
+            srtt_ms: self.last_srtt,
+        }
     }
 
     /// True if predictions may currently be made.
