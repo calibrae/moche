@@ -19,6 +19,23 @@
 //! until acked. Everything here follows from sending only prefixes of one
 //! stream, cut at a non-decreasing point.
 //!
+//! **Pipelining (round 13).** While a big state (more than `BIG_STATE_BYTES` of
+//! raw input) is unacked and the pipeline is not full (`MAX_PIPELINE_STATES`),
+//! the next run of at most `state_limit` bytes goes out as a NEW state diffed
+//! against the newest state sent (the one the server most likely holds when it
+//! arrives), one frame interval after the last send, so several states are in
+//! flight per RTT. `throwaway_num` stays at the acked state, so a base the
+//! server needs is never discarded. If a state is lost the server drops the
+//! later ones (their base is missing); recovery is one state at a time: after
+//! the big-state RTO only the OLDEST unacked state is re-sent, against the
+//! acked state, with exactly its first content (B2); the ack for it (the
+//! server acks the highest state it holds) lets the next one be re-sent the
+//! same way. Pipelining engages only after `PIPELINE_AFTER_CLEAN` big states
+//! were acked in a row with no re-send, and any re-send of a big state switches
+//! it off until that streak is earned again (a lossy link goes one state at a
+//! time, as before). Small states (typing) never take this path: their schedule on the
+//! wire is unchanged (`typing_wire_schedule_is_unchanged_by_pipelining`).
+//!
 //! The cap (`state_limit`) is adaptive and applies ONLY to the next cut, never
 //! to a state already out. It starts at the floor `MIN_STATE_BYTES` (slow
 //! start: a state is resent whole until every fragment of one copy gets
@@ -138,6 +155,43 @@ const MAX_LOSS_RTO_MS: u64 = 3000;
 /// Consecutive clean (acked at first send, cap-filling) states before the cap
 /// doubles back after a shrink.
 const GROW_AFTER_CLEAN: u32 = 2;
+/// Most states in flight while a paste is pipelined (see the module docs).
+pub const MAX_PIPELINE_STATES: usize = 4;
+/// Big states acked in a row with no re-send before a paste is pipelined (and
+/// again after any re-send of a big state).
+const PIPELINE_AFTER_CLEAN: u32 = 4;
+
+/// A state we have sent and the server has not (yet) acked, with its own send
+/// bookkeeping. The queue's front is the acked state, a placeholder.
+#[derive(Debug, Clone)]
+struct Flight {
+    num: u64,
+    /// Elements (global count) the state's content holds.
+    count: u64,
+    /// Times this state has been sent.
+    sends: u32,
+    first_sent: u64,
+    last_sent: u64,
+    /// It already caused a cap shrink (at most one per state).
+    shrunk: bool,
+    /// It was the first data frame after `ISOLATED_AFTER_MS` of data silence:
+    /// its first re-send comes at the frame interval.
+    isolated: bool,
+}
+
+impl Flight {
+    fn acked(num: u64, count: u64) -> Self {
+        Flight {
+            num,
+            count,
+            sends: 0,
+            first_sent: 0,
+            last_sent: 0,
+            shrunk: false,
+            isolated: false,
+        }
+    }
+}
 
 /// Source of random bytes supplied by the host (used for chaff only).
 pub type Rng = Box<dyn FnMut(&mut [u8]) + Send>;
@@ -192,25 +246,23 @@ pub struct Transport {
     /// Received datagrams that authenticated but whose message was rejected
     /// (bad fragment, over a size limit, bad zlib, bad instruction or diff).
     rx_errors: u64,
-    /// Sent states as `(num, element count)`; the front is the acked state.
-    sent: VecDeque<(u64, u64)>,
+    /// Sent states; the front is the acked state (a placeholder).
+    sent: VecDeque<Flight>,
     /// Next state number to hand out.
     next_num: u64,
     /// Current cap of raw input bytes per state.
     state_limit: usize,
     /// Times loss suspicion halved (or tried to halve) the cap.
     cap_shrinks: u64,
-    /// Times the newest unacked state has been sent (0 when none is unacked).
-    sends: u32,
-    /// The newest state was the first data frame after `ISOLATED_AFTER_MS` of
-    /// data silence: its first re-send comes at the frame interval.
-    isolated: bool,
+    /// Most states in flight when pipelining (1 disables it).
+    max_pipeline: usize,
+    /// Consecutive big states acked without any re-send. A paste is pipelined
+    /// only after `PIPELINE_AFTER_CLEAN` of them, and any re-send of a big state
+    /// resets it: on a lossy link a lost state makes every state pipelined
+    /// behind it a wasted copy (round 13 lab: 2x the bytes at 10% loss).
+    clean_streak: u32,
     /// When the last frame carrying data (new state or re-send) went out.
     last_data_send: Option<u64>,
-    /// When the newest state was first sent.
-    first_sent: u64,
-    /// The newest state already caused a shrink (at most one per state).
-    shrunk: bool,
     /// Consecutive clean cap-filling acks since the last shrink.
     clean_acks: u32,
     unsent_since: Option<u64>,
@@ -262,15 +314,13 @@ impl Transport {
             queued: 0,
             send_errors: 0,
             rx_errors: 0,
-            sent: VecDeque::from([(0, 0)]),
+            sent: VecDeque::from([Flight::acked(0, 0)]),
             next_num: 1,
             state_limit: MIN_STATE_BYTES,
             cap_shrinks: 0,
-            sends: 0,
-            isolated: false,
+            max_pipeline: MAX_PIPELINE_STATES,
+            clean_streak: 0,
             last_data_send: None,
-            first_sent: 0,
-            shrunk: false,
             clean_acks: 0,
             unsent_since: None,
             last_send: None,
@@ -339,6 +389,12 @@ impl Transport {
     /// state we do hold, so the server re-diffs from it.
     pub fn rx_gaps(&self) -> u64 {
         self.rx_gaps
+    }
+
+    /// States sent and not yet acked (at most `MAX_PIPELINE_STATES` while a
+    /// paste is pipelined; typing keeps a handful of small ones).
+    pub fn in_flight_states(&self) -> usize {
+        self.sent.len() - 1
     }
 
     /// Current cap of raw input bytes per sent state (adaptive).
@@ -526,32 +582,34 @@ impl Transport {
     }
 
     fn process_ack(&mut self, n: u64) {
-        let front = self.sent.front().map_or(0, |s| s.0);
+        let front = self.sent.front().map_or(0, |s| s.num);
         if n <= front {
             return;
         }
-        let Some(p) = self.sent.iter().position(|s| s.0 == n) else {
+        let Some(p) = self.sent.iter().position(|s| s.num == n) else {
             return;
         };
-        let was_newest = p + 1 == self.sent.len();
-        if was_newest {
-            // Everything sent is acked. Grow only after clean first-send acks
-            // of states that filled the cap (a keystroke ack proves nothing).
-            let size = self.bytes_to(self.last_count());
-            if self.sends == 1 && size * 2 >= self.state_limit {
+        // Grow only after clean first-send acks of states that filled the cap
+        // (a keystroke ack proves nothing). An ack is cumulative: it covers
+        // every state up to `n`, each judged on its own send count and size.
+        for i in 1..=p {
+            let size = self.bytes_to(self.sent[i].count) - self.bytes_to(self.sent[i - 1].count);
+            let sends = self.sent[i].sends;
+            if size > BIG_STATE_BYTES {
+                self.clean_streak = if sends == 1 { self.clean_streak + 1 } else { 0 };
+            }
+            if sends == 1 && size * 2 >= self.state_limit {
                 self.clean_acks += 1;
                 if self.clean_acks >= GROW_AFTER_CLEAN && self.state_limit < MAX_STATE_BYTES {
                     self.state_limit = (self.state_limit * 2).min(MAX_STATE_BYTES);
                     self.clean_acks = 0;
                 }
-            } else if self.sends > 1 {
+            } else if sends > 1 {
                 self.clean_acks = 0;
             }
-            self.sends = 0;
-            self.shrunk = false;
         }
         self.sent.drain(..p);
-        let count = self.sent[0].1;
+        let count = self.sent[0].count;
         let drop = ((count - self.acked_count) as usize).min(self.elements.len());
         for e in self.elements.drain(..drop) {
             if let Element::Data(b) = e {
@@ -563,16 +621,17 @@ impl Transport {
     }
 
     fn last_count(&self) -> u64 {
-        self.sent.back().map_or(0, |s| s.1)
+        self.sent.back().map_or(0, |s| s.count)
     }
 
-    /// Highest element count (global index) the next frame may carry: the
-    /// longest prefix of the unacked elements whose data is at most
-    /// `state_limit`, but always at least one element.
-    fn cut_count(&self) -> u64 {
+    /// Highest element count (global index) a frame cut from global count
+    /// `from` may carry: the longest run of elements after `from` whose data
+    /// is at most `state_limit`, but always at least one element (if any).
+    fn cut_count_from(&self, from: u64) -> u64 {
+        let skip = from.saturating_sub(self.acked_count) as usize;
         let mut bytes = 0usize;
         let mut n = 0u64;
-        for e in &self.elements {
+        for e in self.elements.iter().skip(skip) {
             if let Element::Data(b) = e {
                 if n > 0 && bytes + b.len() > self.state_limit {
                     break;
@@ -581,7 +640,7 @@ impl Transport {
             }
             n += 1;
         }
-        self.acked_count + n
+        from + n
     }
 
     /// Raw data bytes of the unacked elements up to global count `count`.
@@ -616,32 +675,70 @@ impl Transport {
         (v.ceil() as u64).clamp(MIN_LOSS_RTO_MS, MAX_LOSS_RTO_MS)
     }
 
-    /// Called on each resend of the newest state. Halves the cap, for the
-    /// NEXT cut only, when that (big) state has been sent three times and a
-    /// full loss RTO has passed since its first send. The state in flight is
-    /// never touched (see the module invariant).
-    fn note_resend(&mut self, now_ms: u64) {
-        if self.shrunk || !self.outstanding_big() || self.sends < 3 {
+    /// Called on each resend of state `idx`. Halves the cap, for the NEXT cut
+    /// only, when that (big) state has been sent three times and a full loss
+    /// RTO has passed since its first send. The state in flight is never
+    /// touched (see the module invariant).
+    fn note_resend(&mut self, idx: usize, now_ms: u64) {
+        let f = &self.sent[idx];
+        if f.shrunk || !self.outstanding_big() || f.sends < 3 {
             return;
         }
-        if now_ms.saturating_sub(self.first_sent) < self.loss_rto_ms() {
+        if now_ms.saturating_sub(f.first_sent) < self.loss_rto_ms() {
             return;
         }
-        self.shrunk = true;
+        self.sent[idx].shrunk = true;
         self.cap_shrinks += 1;
         self.clean_acks = 0;
         self.state_limit = (self.state_limit / 2).max(MIN_STATE_BYTES);
     }
 
-    /// Element count the next frame carries: the newest sent state again
-    /// while a big state is in flight (never re-cut), else the longest prefix
-    /// under the cap, never less than what was already sent.
+    /// True when a paste may put one more state in flight: something big is
+    /// already out and nothing out has needed a re-send (a loss-free run so
+    /// far), the pipeline is not full, and there is unsent input.
+    fn can_pipeline(&self) -> bool {
+        self.outstanding_big()
+            && self.clean_streak >= PIPELINE_AFTER_CLEAN
+            && self.sent.len() - 1 < self.max_pipeline
+            && self.sent.get(1).is_some_and(|f| f.sends == 1)
+            && self.total > self.last_count()
+    }
+
+    /// Element count the next NEW state would carry. While something big is in
+    /// flight: the next run of at most `state_limit` bytes after the newest
+    /// state if the pipeline allows it, else nothing new (never a re-cut of
+    /// what is out). Otherwise the longest prefix under the cap from the acked
+    /// state, never less than what was already sent.
     fn cut_target(&self) -> u64 {
         let last = self.last_count();
         if self.outstanding_big() {
-            last
+            if self.can_pipeline() {
+                self.cut_count_from(last).max(last)
+            } else {
+                last
+            }
         } else {
-            self.cut_count().max(last)
+            self.cut_count_from(self.acked_count).max(last)
+        }
+    }
+
+    /// Index in `sent` of the state a re-send repeats: the OLDEST unacked one
+    /// while a paste is out (its base, the acked state, is certain, and it is
+    /// the one holding everything up), else the newest (the typing path).
+    fn resend_idx(&self) -> usize {
+        if self.outstanding_big() {
+            1
+        } else {
+            self.sent.len() - 1
+        }
+    }
+
+    /// Earliest time the state a re-send would repeat is due again.
+    fn resend_at(&self) -> u64 {
+        if self.outstanding_big() {
+            self.sent[1].last_sent + self.big_resend_interval()
+        } else {
+            self.last_send.map_or(0, |t| t + self.small_resend_ms())
         }
     }
 
@@ -650,7 +747,7 @@ impl Transport {
     /// (see `ISOLATED_AFTER_MS`) is the exception and waits only for the frame
     /// interval, exactly once: later copies go back to the slow pace.
     fn small_resend_ms(&self) -> u64 {
-        if self.isolated && self.sends == 1 {
+        if self.sent.back().is_some_and(|f| f.isolated && f.sends == 1) {
             return self.frame_interval();
         }
         let ack_back = (self.rtt.srtt_ms() + SMALL_RESEND_MARGIN_MS).ceil() as u64;
@@ -682,19 +779,20 @@ impl Transport {
         }
         if self.data_outstanding() {
             let big = self.outstanding_big();
-            let pace = if big {
-                self.big_resend_interval()
-            } else {
-                self.small_resend_ms()
-            };
             let mut t = if self.cut_target() > self.last_count() {
                 // new input: one frame interval after the last send of any kind
                 let collect = self.unsent_since.unwrap_or(0) + COLLECT_MS;
                 let by_interval = self.last_send.map(|t| t + self.frame_interval());
-                by_interval.map_or(collect, |b| b.max(collect))
+                let new_at = by_interval.map_or(collect, |b| b.max(collect));
+                // a pipelined paste still re-sends its oldest state when due
+                if big {
+                    new_at.min(self.resend_at())
+                } else {
+                    new_at
+                }
             } else {
                 // pure resend of the unacked state
-                self.last_send.map_or(0, |t| t + pace)
+                self.resend_at()
             };
             // A big state is not re-sent early just to carry a delayed ack.
             if let (Some(a), false) = (self.ack_due, big) {
@@ -719,40 +817,71 @@ impl Transport {
     }
 
     fn build_frame(&mut self, now_ms: u64) {
-        let old_num = self.sent[0].0;
+        let acked_num = self.sent[0].num;
+        let mut old_num = acked_num;
         let carries_data = self.data_outstanding();
         let (new_num, diff) = if carries_data {
-            let last_num = self.sent.back().map_or(0, |s| s.0);
+            let big = self.outstanding_big();
             let cut = self.cut_target();
-            let n_el = (cut - self.acked_count) as usize;
-            let diff = encode_diff(&coalesce(self.elements.iter().take(n_el)));
-            if cut > self.last_count() {
+            let new_state = cut > self.last_count() && !(big && now_ms >= self.resend_at());
+            if new_state {
+                // While a paste is out the new state is diffed against the
+                // newest one sent (the one the server most likely holds by
+                // the time this arrives); otherwise against the acked state.
+                let from = if big {
+                    old_num = self.sent.back().map_or(0, |s| s.num);
+                    self.last_count()
+                } else {
+                    self.acked_count
+                };
+                let skip = (from - self.acked_count) as usize;
+                let take = (cut - from) as usize;
+                let diff = encode_diff(&coalesce(self.elements.iter().skip(skip).take(take)));
                 let n = self.next_num;
                 self.next_num += 1;
-                self.sent.push_back((n, cut));
+                let isolated = self
+                    .last_data_send
+                    .is_none_or(|t| now_ms.saturating_sub(t) >= ISOLATED_AFTER_MS);
+                self.sent.push_back(Flight {
+                    num: n,
+                    count: cut,
+                    sends: 1,
+                    first_sent: now_ms,
+                    last_sent: now_ms,
+                    shrunk: false,
+                    isolated,
+                });
                 let cum = self.acked_bytes + self.bytes_to(cut) as u64;
                 if self.echo_marks.len() >= MAX_ECHO_MARKS {
                     // an echo ack older than the oldest kept mark is ignored
                     self.echo_marks.pop_front();
                 }
                 self.echo_marks.push_back((n, cum));
-                self.sends = 1;
-                self.isolated = self
-                    .last_data_send
-                    .is_none_or(|t| now_ms.saturating_sub(t) >= ISOLATED_AFTER_MS);
-                self.first_sent = now_ms;
-                self.shrunk = false;
                 self.unsent_since = (self.total > cut).then_some(now_ms);
                 (n, diff)
             } else {
-                self.sends += 1;
-                self.note_resend(now_ms);
-                (last_num, diff)
+                // Re-send, always against the acked state (certain to be held):
+                // the same content as the first send, whatever base it had then.
+                let idx = self.resend_idx();
+                let count = self.sent[idx].count;
+                let n_el = (count - self.acked_count) as usize;
+                let diff = encode_diff(&coalesce(self.elements.iter().take(n_el)));
+                self.sent[idx].sends += 1;
+                self.sent[idx].last_sent = now_ms;
+                if big {
+                    self.clean_streak = 0;
+                }
+                self.note_resend(idx, now_ms);
+                (self.sent[idx].num, diff)
             }
         } else {
             let n = self.next_num;
             self.next_num += 1;
-            self.sent.push_back((n, self.total));
+            let mut f = Flight::acked(n, self.total);
+            f.sends = 1;
+            f.first_sent = now_ms;
+            f.last_sent = now_ms;
+            self.sent.push_back(f);
             (n, Vec::new())
         };
         let mut b = [0u8; 1];
@@ -764,7 +893,7 @@ impl Transport {
             old_num,
             new_num,
             ack_num: self.latest,
-            throwaway_num: old_num,
+            throwaway_num: acked_num,
             diff,
             chaff,
         }
@@ -1295,25 +1424,49 @@ mod tests {
         master: Vec<u8>,
         /// state num -> (data bytes, resize count) of its content
         states: std::collections::BTreeMap<u64, (usize, usize)>,
+        /// States usable as a base: applied and not below a throwaway seen.
+        held: std::collections::BTreeSet<u64>,
         accepted: usize,
+        /// Instructions dropped because their base was not held (as the real
+        /// server does).
+        dropped: usize,
     }
 
     impl Model {
         fn new() -> Self {
             Model {
                 states: std::collections::BTreeMap::from([(0, (0, 0))]),
+                held: [0].into(),
                 ..Default::default()
             }
         }
 
-        /// Applies one client instruction; returns its `new_num`.
+        /// Applies one client instruction; returns its `new_num`. Panics when
+        /// the base is not held (use `try_accept` on a lossy path).
         fn accept(&mut self, i: &Instruction) -> u64 {
+            self.try_accept(i).expect("unknown base")
+        }
+
+        /// Applies one client instruction as the real server would: dropped
+        /// (None) when its base state is not held, a duplicate of a held
+        /// number is ignored, a state below the throwaway is gone.
+        fn try_accept(&mut self, i: &Instruction) -> Option<u64> {
             assert!(
                 i.old_num < i.new_num,
                 "old {} >= new {}",
                 i.old_num,
                 i.new_num
             );
+            assert!(
+                i.throwaway_num <= i.old_num,
+                "throwaway {} above old {}",
+                i.throwaway_num,
+                i.old_num
+            );
+            if !self.held.contains(&i.old_num) {
+                self.dropped += 1;
+                return None;
+            }
             let (mut len, mut rs) = *self.states.get(&i.old_num).expect("unknown base");
             for e in decode_diff(&i.diff).unwrap() {
                 match e {
@@ -1363,7 +1516,10 @@ mod tests {
                 self.states.insert(i.new_num, content);
             }
             self.accepted += 1;
-            i.new_num
+            self.held.insert(i.new_num);
+            let below = i.throwaway_num;
+            self.held.retain(|&n| n >= below);
+            Some(i.new_num)
         }
 
         fn stream_at(&self, num: u64) -> &[u8] {
@@ -1400,8 +1556,9 @@ mod tests {
             let Some(msg) = self.reasm.push(inner.frag).unwrap() else {
                 return;
             };
-            let n = self.model.accept(&Instruction::decode(&msg).unwrap());
-            self.acked = self.acked.max(n);
+            if let Some(n) = self.model.try_accept(&Instruction::decode(&msg).unwrap()) {
+                self.acked = self.acked.max(n);
+            }
         }
 
         fn ack_datagram(&mut self) -> Vec<u8> {
@@ -1766,6 +1923,10 @@ mod tests {
         datagrams: usize,
         limit: usize,
         shrinks: u64,
+        /// Most states in flight at any emission.
+        max_flight: usize,
+        /// Instructions the delivered-model server dropped (base not held).
+        dropped: usize,
     }
 
     /// Behaviour of the virtual link, percentages per datagram.
@@ -1808,6 +1969,15 @@ mod tests {
     /// one sees what the link delivers (reordered, duplicated). Both panic on
     /// a B2 violation.
     fn link_sim_cfg(script: &[(u64, &[u8])], cfg: LinkCfg, seed: u64) -> LinkResult {
+        link_sim_depth(script, cfg, seed, MAX_PIPELINE_STATES)
+    }
+
+    fn link_sim_depth(
+        script: &[(u64, &[u8])],
+        cfg: LinkCfg,
+        seed: u64,
+        depth: usize,
+    ) -> LinkResult {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let mut r = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -1820,6 +1990,7 @@ mod tests {
         let want: Vec<u8> = script.iter().flat_map(|(_, b)| b.iter().copied()).collect();
         let mut srv = Server::new();
         let mut t = transport();
+        t.max_pipeline = depth;
         let mut reasm = Reassembler::new();
         let mut emit_reasm = Reassembler::new();
         let mut model = Model::new();
@@ -1829,6 +2000,7 @@ mod tests {
         let mut to_cli: BinaryHeap<Reverse<(u64, u64, Vec<u8>)>> = BinaryHeap::new();
         let mut ctr = 0u64;
         let (mut now, mut bytes, mut datagrams) = (0u64, 0usize, 0usize);
+        let mut max_flight = 0usize;
         let mut next_script = 0usize;
         for _ in 0..5_000_000 {
             let mut next = u64::MAX;
@@ -1857,7 +2029,9 @@ mod tests {
                 let Some(msg) = reasm.push(inner.frag).unwrap() else {
                     continue;
                 };
-                acked = acked.max(model.accept(&Instruction::decode(&msg).unwrap()));
+                if let Some(n) = model.try_accept(&Instruction::decode(&msg).unwrap()) {
+                    acked = acked.max(n);
+                }
                 reply_num += 1;
                 let reply = Server::instr(0, reply_num, acked, &[]);
                 let hold = cfg.ack_hold;
@@ -1876,6 +2050,8 @@ mod tests {
             while let Some(d) = t.poll_transmit(now) {
                 bytes += d.len();
                 datagrams += 1;
+                assert!(d.len() <= crate::network::MAX_DATAGRAM);
+                max_flight = max_flight.max(t.in_flight_states());
                 let o = srv.cipher.open(&d).unwrap();
                 let inner = Inner::decode(&o.plaintext).unwrap();
                 if let Some(msg) = emit_reasm.push(inner.frag).unwrap() {
@@ -1901,6 +2077,8 @@ mod tests {
                     datagrams,
                     limit: t.state_limit(),
                     shrinks: t.cap_shrinks(),
+                    max_flight,
+                    dropped: model.dropped,
                 };
             }
         }
@@ -1962,6 +2140,7 @@ mod tests {
         t.send_keys(0, &data);
         assert_eq!(t.state_limit(), MIN_STATE_BYTES, "slow start");
         t.state_limit = MAX_STATE_BYTES; // as after a clean run of acks
+        t.max_pipeline = 1; // the depth-1 flow this repro is about
         let mut now = 8;
         let first = open_all(&srv, &drain(&mut t, now));
         assert_eq!((first.old_num, first.new_num), (0, 1));
@@ -2035,6 +2214,7 @@ mod tests {
         let mut t = transport();
         t.send_keys(0, &noise(5, 2_000_000));
         t.state_limit = MAX_STATE_BYTES;
+        t.max_pipeline = 1;
         let mut now = 8;
         let mut num = 0u64;
         // state 1 never acked in time: halved to 32 KiB
@@ -2098,6 +2278,170 @@ mod tests {
             assert_eq!(x.limit, MAX_STATE_BYTES, "slow start reached the full cap");
             assert!(ratio <= 1.5, "{ratio}");
         }
+    }
+
+    // ---- round 13: pipelined pastes -----------------------------------------
+
+    /// Several states in flight per RTT: a lossless 4 MiB paste is much faster
+    /// than one state per RTT, never exceeds the pipeline bound, and costs the
+    /// same bytes.
+    #[test]
+    fn pipelining_speeds_up_a_lossless_paste_within_its_bound() {
+        let payload = noise(21, 4 << 20);
+        for (one_way, hold) in [(1, 100), (50, 100), (100, 100)] {
+            let mut cfg = LinkCfg::new(0, one_way);
+            cfg.ack_hold = hold;
+            let one = link_sim_depth(&[(0, &payload)], cfg, 4, 1);
+            let four = link_sim_depth(&[(0, &payload)], cfg, 4, MAX_PIPELINE_STATES);
+            eprintln!(
+                "4 MiB one-way {one_way} hold {hold}: depth 1 {} ms, depth {MAX_PIPELINE_STATES} {} ms (max in flight {})",
+                one.ms, four.ms, four.max_flight
+            );
+            assert_eq!(one.max_flight, 1);
+            assert!(four.max_flight > 1 && four.max_flight <= MAX_PIPELINE_STATES);
+            assert!(four.ms * 2 <= one.ms, "{} vs {}", four.ms, one.ms);
+            assert!(four.bytes as f64 <= one.bytes as f64 * 1.02);
+            assert_eq!(four.shrinks, 0);
+            assert_eq!(four.dropped, 0, "lossless: no base is ever missing");
+        }
+    }
+
+    /// The wire shape of a pipeline, state by state: each new state is diffed
+    /// against the newest one sent, throwaway stays at the acked state, the
+    /// pipeline is bounded, and after the RTO the OLDEST state is re-sent
+    /// against the acked state with exactly its first content (B2).
+    #[test]
+    fn pipeline_bases_throwaway_bound_and_resend_of_the_oldest() {
+        let mut srv = Server::new();
+        let mut model = Model::new();
+        let mut t = transport();
+        t.state_limit = MAX_STATE_BYTES;
+        t.clean_streak = PIPELINE_AFTER_CLEAN; // as after a clean run of acks
+        let data = noise(31, 400_000);
+        t.send_keys(0, &data);
+        let mut firsts: Vec<Instruction> = Vec::new();
+        let mut now = 0;
+        for k in 0..MAX_PIPELINE_STATES {
+            now = t.next_deadline_ms().unwrap();
+            let i = open_all(&srv, &drain(&mut t, now));
+            model.accept(&i);
+            let n = k as u64;
+            assert_eq!((i.old_num, i.new_num, i.throwaway_num), (n, n + 1, 0));
+            firsts.push(i);
+        }
+        assert_eq!(t.in_flight_states(), MAX_PIPELINE_STATES);
+        // full: the next deadline is the oldest state's re-send, never a 5th state
+        let d = t.next_deadline_ms().unwrap();
+        assert!(d >= now + MIN_RTO_MS, "deadline {d} after last send {now}");
+        let again = open_all(&srv, &drain(&mut t, d));
+        model.accept(&again);
+        assert_eq!(
+            (again.old_num, again.new_num),
+            (0, 1),
+            "oldest, off the acked state"
+        );
+        assert_eq!(again.diff, firsts[0].diff, "same content as its first send");
+        assert_eq!(again.throwaway_num, 0);
+        assert_eq!(t.in_flight_states(), MAX_PIPELINE_STATES);
+        // state 1 acked (the server never saw 2..4): the next re-send is state 2,
+        // now from the acked state 1, content unchanged
+        t.handle_datagram(d + 1, &srv.send(0, None, Server::instr(0, 1, 1, &[]))[0]);
+        let d2 = t.next_deadline_ms().unwrap();
+        let i2 = open_all(&srv, &drain(&mut t, d2));
+        model.accept(&i2);
+        assert_eq!((i2.old_num, i2.new_num, i2.throwaway_num), (1, 2, 1));
+        assert_eq!(
+            decode_diff(&i2.diff).unwrap(),
+            decode_diff(&firsts[1].diff).unwrap()
+        );
+    }
+
+    /// A lost state in a pipeline: the server drops the later ones (their base
+    /// is gone), the client recovers one state at a time, and everything is
+    /// delivered. Randomised loss, jitter that reorders, duplicates, delayed
+    /// acks; both server models panic on any B2 violation, the delivered one
+    /// also drops what has no base.
+    #[test]
+    fn pipeline_survives_loss_reorder_and_duplicates() {
+        let payload = noise(41, 600_000);
+        let mut dropped = 0;
+        for case in 0..24u64 {
+            let cfg = LinkCfg {
+                loss_up: [0, 2, 5, 10][(case % 4) as usize],
+                loss_down: [0, 5, 20][(case % 3) as usize],
+                one_way: [1, 20, 80][((case / 3) % 3) as usize],
+                jitter: [0, 30, 120][((case / 2) % 3) as usize],
+                dup: [0, 10][(case % 2) as usize],
+                ack_hold: [0, 100][((case / 4) % 2) as usize],
+            };
+            let x = link_sim_cfg(&[(0, &payload)], cfg, case + 7);
+            assert!(
+                x.max_flight <= MAX_PIPELINE_STATES,
+                "case {case}: {}",
+                x.max_flight
+            );
+            dropped += x.dropped;
+        }
+        assert!(
+            dropped > 0,
+            "no pipelined state ever lost its base: the test is toothless"
+        );
+    }
+
+    /// The gate: a paste goes one state at a time until enough big states were
+    /// acked with no re-send, and any re-send of a big state closes it again.
+    #[test]
+    fn pipelining_is_earned_and_lost_on_any_resend() {
+        let mut srv = Server::new();
+        let mut t = transport();
+        t.state_limit = MAX_STATE_BYTES;
+        t.send_keys(0, &noise(61, 2_000_000));
+        let mut now;
+        let mut acked = 0;
+        for k in 0..PIPELINE_AFTER_CLEAN as u64 {
+            now = t.next_deadline_ms().unwrap();
+            let i = open_all(&srv, &drain(&mut t, now));
+            assert_eq!((i.old_num, i.new_num), (acked, acked + 1));
+            assert_eq!(t.in_flight_states(), 1, "state {k}: not earned yet");
+            acked += 1;
+            t.handle_datagram(
+                now + 1,
+                &srv.send(0, None, Server::instr(0, acked, acked, &[]))[0],
+            );
+        }
+        // earned: the next state is followed by another before any ack
+        now = t.next_deadline_ms().unwrap();
+        drain(&mut t, now);
+        now = t.next_deadline_ms().unwrap();
+        drain(&mut t, now);
+        assert_eq!(t.in_flight_states(), 2);
+        while t.in_flight_states() < MAX_PIPELINE_STATES {
+            now = t.next_deadline_ms().unwrap();
+            drain(&mut t, now);
+        }
+        // a re-send of the oldest closes the gate; after its ack, no new pipelined state
+        let d = t.next_deadline_ms().unwrap();
+        let again = open_all(&srv, &drain(&mut t, d));
+        assert_eq!(again.new_num, acked + 1);
+        assert_eq!(t.clean_streak, 0);
+        let all = acked + MAX_PIPELINE_STATES as u64;
+        t.handle_datagram(d + 1, &srv.send(0, None, Server::instr(0, 99, all, &[]))[0]);
+        let d = t.next_deadline_ms().unwrap();
+        let i = open_all(&srv, &drain(&mut t, d));
+        assert_eq!(i.old_num, all, "one state at a time again");
+        assert_eq!(t.in_flight_states(), 1);
+    }
+
+    /// A key typed while a paste is in flight joins the stream as one more
+    /// state of the pipeline; nothing is lost or reordered.
+    #[test]
+    fn typing_during_a_pipelined_paste_is_delivered_in_order() {
+        let paste = noise(51, 300_000);
+        let script: Vec<(u64, &[u8])> = vec![(0, &paste), (40, b"a"), (400, b"bc"), (900, b"d")];
+        let mut cfg = LinkCfg::new(0, 30);
+        cfg.ack_hold = 100;
+        let x = link_sim_cfg(&script, cfg, 9);
+        assert!(x.max_flight > 1);
     }
 
     #[test]
@@ -2463,6 +2807,48 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "outside the stock envelope: {bad:?}");
+    }
+
+    /// FNV-1a fingerprint of the exact datagram schedule (time, state number,
+    /// emptiness, ack) of typing runs. The numbers were recorded from the code
+    /// BEFORE pipelining (`f4ff63c`): typing must not change on the wire, to the
+    /// millisecond, whatever else the sender learns to do with big pastes.
+    const GOLDEN_TYPING: [(u64, u64, usize, u64); 16] = [
+        (5, 1, 324, 9926832459446970154),
+        (5, 2, 342, 17435919702353329606),
+        (5, 3, 332, 2763189762140085381),
+        (5, 4, 333, 5548139505928706718),
+        (25, 1, 302, 3848065497504010281),
+        (25, 2, 306, 10811118229782996610),
+        (25, 3, 304, 4174556675956277181),
+        (25, 4, 305, 12890687352972109131),
+        (50, 1, 321, 4853420238760040210),
+        (50, 2, 332, 12205729059083638882),
+        (50, 3, 321, 13381802132038036928),
+        (50, 4, 327, 7453201082379967681),
+        (100, 1, 287, 914439899997775524),
+        (100, 2, 285, 10446394644604089208),
+        (100, 3, 285, 6346900567078309310),
+        (100, 4, 286, 7952460940684851414),
+    ];
+
+    #[test]
+    fn typing_wire_schedule_is_unchanged_by_pipelining() {
+        let mut got = Vec::new();
+        for ow in [5u64, 25, 50, 100] {
+            for seed in 1..=4 {
+                let run = typing_run(ow, 30, 300, seed);
+                let mut h = 0xcbf2_9ce4_8422_2325u64;
+                for d in &run.sent {
+                    for v in [d.at, d.new_num, u64::from(d.empty), d.ack] {
+                        h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                }
+                got.push((ow, seed, run.sent.len(), h));
+            }
+        }
+        eprintln!("{got:?}");
+        assert_eq!(got, GOLDEN_TYPING.to_vec());
     }
 
     /// A standalone ack never goes out when a keystroke is within the ack
