@@ -455,6 +455,25 @@ halved once per state that stays unacked for a full loss RTO and three sends, re
 after two clean cap-filling first-send acks). Simulated 1 MiB paste at 10% loss: about
 5.7-7.9x payload (round-4 fixed 16 KiB: 5.9x); the earlier 4.1x relied on re-cutting.
 
+**Pipelined pastes (round 13, moche choice; server tolerance UNVERIFIED).** While a big state is unacked,
+moche cuts the next run of input as a new state diffed against the NEWEST state sent (not the acked one), up
+to 4 states in flight, one frame interval apart. Rules, all enforced by the sans-IO model server in `ssp.rs`:
+
+- `throwaway_num` stays at the acked state (never at the newest), so a base the server may need is never discarded.
+- Content only grows with the state number (B2); a pipelined state extends the previous one.
+- If a state is lost, the server must drop the later ones (their `old_num` is not held). Recovery: after the
+  big-state RTO only the OLDEST unacked state is re-sent, with `old_num` = the acked state (certain to be held)
+  and exactly its first content; the server's ack (highest state held) then frees the next one. No state number is
+  ever abandoned or recut. Pipelining stops once the oldest needs a re-send, and stays off after a cap shrink
+  until the cap is back at the maximum. Max datagram 1252, resends RTO-paced, one state at a time.
+- Small states (typing) never take this path; their wire schedule is pinned by a golden test recorded before the change.
+
+UNVERIFIED against a real `mosh-server` 1.4.0: that it applies a diff whose base is a state received a moment
+earlier but not yet acked (the stock server itself does this in the other direction, obs U13); that it accepts a
+state arriving before its predecessor was applied by dropping it without aborting; that it does not abort when a
+lower-numbered state arrives after a higher one it already holds (the model treats this as legal). The x86 lab
+run that would observe these was not done (see `observations-round13.md`).
+
 Items 5-6 timings are from [1] and match both capture rounds; whether a server tolerates
 deviations from them (a client that never heartbeats, acks late, omits chaff) is
 untested (U12). The cumulative-from-acked choice in item 3 is safe for the stock server
