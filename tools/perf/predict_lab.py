@@ -3,7 +3,7 @@
 mosh-client. Runs INSIDE the client VM of the VM lab (tools/vm-lab/README.md); the server VM runs a
 stock mosh-server. Netem is set by the caller (tools/perf/predict_lab_run.sh), not here.
 
-  python3 predict_lab.py latency  --client C --out F.json [--lines N] [--seed S]
+  python3 predict_lab.py latency  --client C --out F.json [--lines N] [--seed S] [--gap MS]
   python3 predict_lab.py scenario --client C --name N --out F.json
   python3 predict_lab.py cost     --client C --out F.json
   python3 predict_lab.py wire     --client C --out F.json
@@ -32,6 +32,7 @@ SRVDIR = os.environ.get("PRED_SRV_DIR", "~/pred")
 SSH = ["ssh", "-i", KEY, "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
        "-o", "ControlMaster=auto", "-o", "ControlPath=/tmp/pred-ssh-%C", "-o", "ControlPersist=300",
        AUSER + "@" + A]
+GAPS = (0.08, 0.12)  # key gap range for latency typing, set by --gap
 CLSOCK = "plcl"
 SECRET = "ZQXJKVWPY"
 WORDS = ("amber basalt cobalt dune ember fjord garnet harbor indigo jasper kelp lagoon marble nectar "
@@ -402,7 +403,7 @@ def run_latency(a):
         s.warmup(rng)
         pl = Plan(rng)
         for i in range(a.lines):
-            pl.type("# L%d %s" % (i, " ".join(rng.choice(WORDS) for _ in range(5))))
+            pl.type("# L%d %s" % (i, " ".join(rng.choice(WORDS) for _ in range(5))), gap=GAPS)
             pl.key("Enter", rng.uniform(0.6, 1.0))
         s.run_plan(pl, tail=3.0)
         chars = []
@@ -785,6 +786,7 @@ def run_wire(a):
 
 
 def main():
+    global GAPS
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["latency", "scenario", "cost", "wire"])
     ap.add_argument("--client", required=True)
@@ -794,7 +796,9 @@ def main():
     ap.add_argument("--secs", type=float, default=30)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--tag", default="")
+    ap.add_argument("--gap", type=float, default=100.0, help="mean key gap in ms for latency typing (+-20%%)")
     a = ap.parse_args()
+    GAPS = (a.gap * 0.0008, a.gap * 0.0012)
     for k in ("PRED_A_IP", "PRED_B_IP", "PRED_KEY"):
         if not os.environ.get(k):
             sys.exit("set " + k)

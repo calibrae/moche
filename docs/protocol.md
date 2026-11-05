@@ -343,13 +343,19 @@ each "moche choice" is ours):
   re-sent a state only about 100-112 ms after its last send (RTT 100 and 200), once about 145 ms (RTT 100,
   idle), and almost never otherwise (10 resends for 296 keys at RTT 100, 3 at RTT 200): the next key supersedes
   the state first. Only one case differs: right after a long silence (nothing received for seconds) the
-  stock client re-sent at the frame interval (57-62 ms at RTT 100, 20-23 ms at RTT 10); moche does not copy that.
+  stock client re-sent at the frame interval (57-62 ms at RTT 100, 20-23 ms at RTT 10), once, then back to the slow pace.
+  Moche copies that since round 10 (see "Moche choice"); rounds 8-9 did not, and a lost isolated key was then recovered
+  about 100 ms later than stock (round 9, `observations-round9.md`).
 - Delayed ack (OBSERVED): a standalone empty ack goes out 100-119 ms after the FIRST unacked server frame when
   nothing else was sent; a key frame sent earlier carries the ack, so while typing at 10 keys/s the stock
   client sent 0 to 5 % standalone acks. The server sent two frames per key about 55 ms apart (data+ack, then
   an echo-ack frame); the client acks neither on its own.
-- Moche choice: `COLLECT_MS = 0`; small-state resend after `max(frame interval, 110 ms, min(SRTT + 50 ms, 250 ms))`.
-  Big states keep their RTO-based resend interval.
+- Moche choice: `COLLECT_MS = 0`; small-state resend after `max(frame interval, 110 ms, min(SRTT + 50 ms, 250 ms))`,
+  except the FIRST re-send of a state that was the first data frame after at least 2 s without any data frame (new
+  state or re-send; acks and heartbeats do not count): that one waits only the frame interval (`ISOLATED_AFTER_MS`,
+  the 2 s is OUR CHOICE, the behaviour is OBSERVED). A state sent while typing, and every later copy, use the slow pace.
+  Big states keep their RTO-based resend interval. `FRAME_EXTRA_MS` stays 6: round 10 swept 3-10 and found no value
+  that matches stock's typing echo at every RTT and key cadence (`observations-round10.md`).
 
 **Contradiction flagged (not overwritten): RTO floor.** [1] gives a 50 ms minimum
 retransmission timeout. Round 1 saw resends 21 and 28 ms apart (RTT about 1 ms). Round 2
@@ -410,7 +416,8 @@ server.** Constants are named and live in one place:
 4. Resend (r2 §B, §C; timing revised in round 8): while the last instruction is unacked, send it
    again no sooner than `max(frame slot, 110 ms, min(SRTT + 50 ms, 250 ms))` after the last send (round 1-7 moche
    used the frame slot, which sent 1.5 to 2.8 times the stock client's datagrams while typing, see
-   `observations-round8.md`). If nothing new was typed, repeat the same (old, new) and diff; if new input
+   `observations-round8.md`); the first re-send of a state that is the first data frame after >= 2 s of data silence
+   goes out after the frame interval only (round 10), once. If nothing new was typed, repeat the same (old, new) and diff; if new input
    arrived, use a fresh `new_num` and the cumulative diff from the acked state (this is
    what the server was seen doing under loss). Every copy gets a fresh wire counter and
    a fresh `frag_id` (per instruction sent, section 3). No exponential backoff.

@@ -38,7 +38,10 @@
 //! id, reusing the same `new_num`. Small frames (at most `BIG_STATE_BYTES`
 //! of already-sent raw input outstanding) are re-sent after `max(frame slot,
 //! SMALL_RESEND_MS, min(SRTT + SMALL_RESEND_MARGIN_MS, MAX_FRAME_MS))` (round 8:
-//! the stock client does not resend at the frame slot while typing); new input
+//! the stock client does not resend at the frame slot while typing), except the
+//! first state sent after `ISOLATED_AFTER_MS` of data silence, whose first
+//! re-send comes at the frame interval, once (round 10: a lost isolated key is
+//! then recovered as fast as the stock client does it); new input
 //! waits only for the frame slot (about SRTT/2, at least 20 ms) after the last
 //! send; a big outstanding state is re-sent at most once
 //! per RTO plus the delayed ack (100 ms to 1 s). Idle, an empty frame (with a fresh `new_num`) goes
@@ -68,7 +71,12 @@ pub const SHUTDOWN_NUM: u64 = u64::MAX;
 
 /// Lower bound of the frame interval in ms (50 Hz cap).
 const MIN_FRAME_MS: u64 = 20;
-/// Observed constant added to SRTT/2 in the frame interval, in ms.
+/// OBSERVED constant added to SRTT/2 in the frame interval, in ms. Kept at 6 on
+/// purpose: round 10 swept 3, 4, 5 and 6 on a real virtual network against the
+/// stock server and found no value that tracks the stock client's typing echo
+/// at every RTT and key cadence (the gap of about 104-106 ms between datagrams at
+/// RTT 200 does not follow this constant; `docs/observations-round10.md`), so
+/// the observed 6 stays rather than a number fitted to one resonance.
 const FRAME_EXTRA_MS: f64 = 6.0;
 /// Upper bound of the frame interval in ms (moche's choice, untested above 105).
 const MAX_FRAME_MS: u64 = 250;
@@ -92,6 +100,14 @@ const SMALL_RESEND_MS: u64 = 110;
 /// 150 ms, the observed idle resend; it keeps a re-send from landing just
 /// before the next key and delaying it by a frame slot.
 const SMALL_RESEND_MARGIN_MS: f64 = 50.0;
+/// A state first sent after at least this long without any data frame (new or
+/// re-sent) is "isolated": a lost isolated key is the one loss a user feels as a
+/// pause, since no later key repairs it. OBSERVED (round 8, confirmed round 9/10):
+/// the stock client re-sends such a first state at the frame interval (57-62 ms
+/// at RTT 100), once, and only then falls back to its slow re-send pace. The 2 s
+/// threshold is OUR CHOICE (anything above a typing pause and below the 3.5 s
+/// idle gap the observation used).
+const ISOLATED_AFTER_MS: u64 = 2000;
 /// Delayed ack.
 const ACK_DELAY_MS: u64 = 100;
 /// Idle heartbeat.
@@ -186,6 +202,11 @@ pub struct Transport {
     cap_shrinks: u64,
     /// Times the newest unacked state has been sent (0 when none is unacked).
     sends: u32,
+    /// The newest state was the first data frame after `ISOLATED_AFTER_MS` of
+    /// data silence: its first re-send comes at the frame interval.
+    isolated: bool,
+    /// When the last frame carrying data (new state or re-send) went out.
+    last_data_send: Option<u64>,
     /// When the newest state was first sent.
     first_sent: u64,
     /// The newest state already caused a shrink (at most one per state).
@@ -246,6 +267,8 @@ impl Transport {
             state_limit: MIN_STATE_BYTES,
             cap_shrinks: 0,
             sends: 0,
+            isolated: false,
+            last_data_send: None,
             first_sent: 0,
             shrunk: false,
             clean_acks: 0,
@@ -622,8 +645,14 @@ impl Transport {
         }
     }
 
-    /// Pause before an unacked small state is sent again.
+    /// Pause before an unacked small state is sent again. OBSERVED (round 8):
+    /// about 100-112 ms while typing. The first re-send of an isolated state
+    /// (see `ISOLATED_AFTER_MS`) is the exception and waits only for the frame
+    /// interval, exactly once: later copies go back to the slow pace.
     fn small_resend_ms(&self) -> u64 {
+        if self.isolated && self.sends == 1 {
+            return self.frame_interval();
+        }
         let ack_back = (self.rtt.srtt_ms() + SMALL_RESEND_MARGIN_MS).ceil() as u64;
         SMALL_RESEND_MS
             .max(ack_back.min(MAX_FRAME_MS))
@@ -691,7 +720,8 @@ impl Transport {
 
     fn build_frame(&mut self, now_ms: u64) {
         let old_num = self.sent[0].0;
-        let (new_num, diff) = if self.data_outstanding() {
+        let carries_data = self.data_outstanding();
+        let (new_num, diff) = if carries_data {
             let last_num = self.sent.back().map_or(0, |s| s.0);
             let cut = self.cut_target();
             let n_el = (cut - self.acked_count) as usize;
@@ -707,6 +737,9 @@ impl Transport {
                 }
                 self.echo_marks.push_back((n, cum));
                 self.sends = 1;
+                self.isolated = self
+                    .last_data_send
+                    .is_none_or(|t| now_ms.saturating_sub(t) >= ISOLATED_AFTER_MS);
                 self.first_sent = now_ms;
                 self.shrunk = false;
                 self.unsent_since = (self.total > cut).then_some(now_ms);
@@ -740,6 +773,9 @@ impl Transport {
             self.send_errors += 1;
         }
         self.last_send = Some(now_ms);
+        if carries_data {
+            self.last_data_send = Some(now_ms);
+        }
         self.ack_due = None;
     }
 
@@ -2142,6 +2178,111 @@ mod tests {
         assert_eq!(out.len(), 1);
         // sent, unacked, small: re-sent after srtt + margin, not an RTO
         assert_eq!(t.next_deadline_ms(), Some(d + 150));
+    }
+
+    // ---- round 10: isolated first key ---------------------------------------
+
+    /// A transport with a learned 100 ms RTT, one key acked at t = 1100.
+    fn transport_rtt100(srv: &mut Server) -> Transport {
+        let mut t = transport();
+        t.send_keys(1000, b"k");
+        let (_, inner, _) = srv.open_client(&drain(&mut t, 1000)[0]);
+        t.handle_datagram(
+            1100,
+            &srv.send(7, Some(inner.ts), Server::instr(0, 1, 1, &[]))[0],
+        );
+        assert_eq!(t.srtt_ms(), 100.0);
+        t
+    }
+
+    /// OBSERVED (round 8/9/10): the first state after a long silence is re-sent
+    /// at the frame interval, once; later copies, and any state sent while
+    /// typing, wait the slow small-resend pause.
+    #[test]
+    fn isolated_first_state_is_resent_once_at_the_frame_interval() {
+        let mut srv = Server::new();
+        let mut t = transport_rtt100(&mut srv);
+        let fi = t.frame_interval();
+        assert!((50..=60).contains(&fi), "frame interval {fi}");
+        // idle for 3 s: a delayed ack and a heartbeat go out, but no data frame
+        let _ = drain(&mut t, 1200);
+        let _ = drain(&mut t, 4200);
+        t.send_keys(4300, b"a");
+        let out = drain(&mut t, 4300);
+        assert_eq!(out.len(), 1);
+        let n = srv.open_client(&out[0]).2.new_num;
+        // first copy: after the frame interval, not after SRTT + margin
+        assert_eq!(t.next_deadline_ms(), Some(4300 + fi));
+        assert!(drain(&mut t, 4300 + fi - 1).is_empty());
+        let out = drain(&mut t, 4300 + fi);
+        assert_eq!(out.len(), 1);
+        assert_eq!(srv.open_client(&out[0]).2.new_num, n, "same state again");
+        // second copy: the slow pace (srtt + margin = 150 ms)
+        assert_eq!(t.next_deadline_ms(), Some(4300 + fi + 150));
+        assert!(drain(&mut t, 4300 + fi + 149).is_empty());
+        let out = drain(&mut t, 4300 + fi + 150);
+        assert_eq!(srv.open_client(&out[0]).2.new_num, n);
+        assert_eq!(t.next_deadline_ms(), Some(4300 + fi + 300));
+    }
+
+    #[test]
+    fn a_state_sent_while_typing_is_not_isolated() {
+        let mut srv = Server::new();
+        let mut t = transport_rtt100(&mut srv);
+        let _ = drain(&mut t, 1200);
+        // a key every 200 ms, never acked: each state follows a data frame
+        // less than 2 s earlier, so none is eligible for the early copy
+        t.send_keys(1500, b"a");
+        let _ = drain(&mut t, 1500);
+        t.send_keys(1700, b"b");
+        let d = t.next_deadline_ms().unwrap();
+        assert!(!drain(&mut t, d).is_empty());
+        assert_eq!(t.next_deadline_ms(), Some(d + 150));
+        // 1.9 s of silence is still "typing"; 2 s is not
+        let last = d;
+        t.send_keys(last + 1999, b"c");
+        let d2 = t.next_deadline_ms().unwrap();
+        assert!(!drain(&mut t, d2).is_empty());
+        assert_eq!(t.next_deadline_ms(), Some(d2 + 150));
+        let mut srv2 = Server::new();
+        let mut t2 = transport_rtt100(&mut srv2);
+        let _ = drain(&mut t2, 1200);
+        t2.send_keys(1000 + 2000, b"c");
+        let d3 = t2.next_deadline_ms().unwrap();
+        assert!(!drain(&mut t2, d3).is_empty());
+        assert_eq!(t2.next_deadline_ms(), Some(d3 + t2.frame_interval()));
+    }
+
+    /// The early copy never delays an owed ack, and an ack that arrives stops
+    /// the copies.
+    #[test]
+    fn isolated_early_resend_does_not_starve_an_owed_ack() {
+        let mut srv = Server::new();
+        let mut t = transport_rtt100(&mut srv);
+        let fi = t.frame_interval();
+        let _ = drain(&mut t, 1200);
+        t.send_keys(4300, b"a");
+        let n = srv.open_client(&drain(&mut t, 4300)[0]).2.new_num;
+        // the server answers (without acking our state) just before the copy
+        let ins = Server::instr(1, 2, 1, &[Element::Data(b"x".to_vec())]);
+        t.handle_datagram(4300 + fi - 10, &srv.send(9, None, ins)[0]);
+        // the copy goes first (earlier than the delayed ack) and carries the ack
+        assert_eq!(t.next_deadline_ms(), Some(4300 + fi));
+        let (_, _, i) = srv.open_client(&drain(&mut t, 4300 + fi)[0]);
+        assert_eq!((i.new_num, i.ack_num), (n, 2));
+        // a server frame after the copy owes an ack within the delayed-ack time
+        let ins = Server::instr(2, 3, 1, &[Element::Data(b"y".to_vec())]);
+        t.handle_datagram(4300 + fi + 20, &srv.send(9, None, ins)[0]);
+        let d = t.next_deadline_ms().unwrap();
+        assert!(d <= 4300 + fi + 20 + ACK_DELAY_MS, "ack deadline {d}");
+        let (_, _, i) = srv.open_client(&drain(&mut t, d)[0]);
+        assert_eq!(i.ack_num, 3);
+        // the server acks our state: nothing left to copy
+        let ins = Server::instr(3, 4, n, &[]);
+        t.handle_datagram(d + 10, &srv.send(9, None, ins)[0]);
+        assert!(t.next_deadline_ms().unwrap() > d + 10);
+        let (_, _, i) = srv.open_client(&drain(&mut t, d + 10 + ACK_DELAY_MS)[0]);
+        assert_eq!(i.diff.len(), 0);
     }
 
     // ---- round 8: typing pattern and the ack/resend policy ------------------
