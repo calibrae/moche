@@ -12,7 +12,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # linux x86_64, linux aarch64, macOS aarch64 (all GitHub-hosted, free for public repos)
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +28,7 @@ jobs:
           cargo --version
 
       - name: cargo-deny
+        if: matrix.os == 'ubuntu-latest'
         run: cargo install --locked cargo-deny
 
       - name: fmt
@@ -39,12 +41,14 @@ jobs:
         run: cargo test --workspace
 
       - name: licenses
+        if: matrix.os == 'ubuntu-latest'
         run: cargo deny check licenses
 
       - name: C header matches the library exports
         run: tools/ffi/check-header.sh
 
       - name: THIRD_PARTY.md is up to date
+        if: matrix.os == 'ubuntu-latest'
         run: tools/third-party.sh --check
 
       # End to end against a stock mosh-server, Linux only. Not a gate while it is new.
@@ -56,3 +60,38 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mosh
           MOCHE_E2E=1 cargo test -p moche-cli --test e2e -- --ignored --nocapture
+
+  # iOS: build the XCFramework (device + simulator slices, no-bitcode gate, header check) and run
+  # the Swift package tests on a simulator.
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          set -eu
+          ch=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$ch" --profile minimal -c rustfmt -c clippy
+          rustc --version
+
+      - name: Build Moche.xcframework
+        run: |
+          set -eu
+          DEVELOPER_DIR="$(xcode-select -p)" tools/ios/build-xcframework.sh
+
+      - name: Swift package tests (simulator)
+        run: |
+          set -eu
+          xcodebuild -version
+          # First available iPhone simulator, by UDID.
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json,sys
+          for rt, devs in sorted(json.load(sys.stdin)["devices"].items(), reverse=True):
+              if "iOS" not in rt: continue
+              for d in devs:
+                  if d["name"].startswith("iPhone"):
+                      print(d["udid"]); sys.exit(0)
+          sys.exit(1)')
+          cd swift
+          xcodebuild test -scheme Moche -destination "id=$udid"
