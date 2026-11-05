@@ -55,9 +55,10 @@ final class SessionTests: XCTestCase {
         let s = try makeSession(now: 1000)
         try s.sendKeys(Data("ls\r".utf8), nowMs: 1000)
         try s.sendKeys(Data(), nowMs: 1000)  // no-op
-        XCTAssertNil(try s.pollTransmit(nowMs: 1000), "collection delay not elapsed")
+        // No collection delay since the SSP timing fix: keys leave at the next deadline
+        // (at or before the first poll), not after a fixed wait.
         let deadline = try XCTUnwrap(try s.nextDeadlineMs())
-        let d = try XCTUnwrap(try s.pollTransmit(nowMs: deadline + 500))
+        let d = try XCTUnwrap(try s.pollTransmit(nowMs: max(deadline, 1000) + 500))
         XCTAssertLessThanOrEqual(d.count, Moche.maxDatagram)
         XCTAssertEqual(d[0] & 0x80, 0, "client to server: direction bit clear")
     }
