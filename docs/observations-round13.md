@@ -104,3 +104,40 @@ pipe beyond run noise (mean 1.080 vs 1.087); stock is about 1.06. Small states k
 - 3 runs per cell is thin: the pipe 2 %/50 ms spread (18-28 s) and the B2 outlier show the noise.
 - The pcap decoder reassembles by fragment id; a re-send reusing an id could merge fragments of two sends, so the
   count of complete states is an upper bound.
+
+## Round 13b: self-limiting pipelining (gate on clean streak), lab re-run
+
+Cause of the doubled bytes at 10 % loss (from the code, confirmed by the simulation, not by a wire trace): the first
+version resumed pipelining as soon as the oldest state was acked, so after every loss a fresh chain of states was cut on
+a base the server might not hold, and each lost state wasted the states pipelined behind it.
+Fix (`ssp.rs`): a paste is pipelined only after `PIPELINE_AFTER_CLEAN` = 4 big states in a row were acked with no
+re-send (`clean_streak`), and any re-send of a big state resets the streak to 0. Unit test
+`pipelining_is_earned_and_lost_on_any_resend`; the pipeline shape test starts with the gate open. In the simulation the
+10 % loss runs are now byte-for-byte the pre-pipelining numbers (the gate never opens at 16 KiB states); lossless sim
+unchanged in kind (4 MiB at 100 ms hold: 6834 -> 2080 ms at 1 ms one-way, 13400 -> 4472 ms at 50 ms, 20100 -> 8072 ms at 100 ms).
+The typing golden test (schedule recorded on `a9b71c1`) still passes.
+
+Lab: same VMs and harness as above; `base` = `a9b71c1`, `gate` = this change, aarch64 musl, 5 runs per cell
+alternating, 4 MiB paste, paste time in s (all runs), sha256 verified on every run counted "ok".
+
+| loss | RTT | base median (runs) | gate median (runs) | client MB sent, base / gate | verdict |
+|---|---|---|---|---|---|
+| 0 | 50 ms | 7.4 (7.36 7.37 7.37 7.43 7.32) | 3.9 (3.93 3.91 3.91 3.92 3.94) | 3.31 / 3.31 | gate 1.9x faster |
+| 0 | 200 ms | 19.4 (19.65 19.39 19.43 19.39 19.72) | 10.2 (10.25 10.34 9.04 10.32 9.12) | 3.31 / 3.31 | gate 1.9x faster |
+| 2 % | 50 ms | 25.3 (25.33 26.05 23.80 22.59 28.41) | 26.0 (22.57 26.03 21.43 27.38 27.29) | 6.35 / 7.59 | same time; **gate sends 20 % more bytes** |
+| 10 % | 50 ms | 135.3 (135 147 134 121 141) | 140.0 (158 146 133 125 140) | 12.99 / 12.96 | same within noise (previous version: 190.8 s, 28 MB) |
+| 10 % | 200 ms | 287 (266 301 302 287 284; 3/5 done) | 287 (287 284 272 302 296; 4/5 done) | 14.33 / 13.98 | same; both near the 300 s timeout (the "not done" runs hit it) |
+
+Honest reading: the 10 %/50 ms regression is gone and no lossy cell is slower beyond noise, the lossless gain is kept.
+Remaining cost: at 2 % loss the gate still opens now and then (4 clean 16-64 KiB states in a row is not rare) and a loss then
+wastes the pipelined states, so bytes are +20 % there with no time gain or loss. Raising the streak would cut that but
+delay the lossless gain (each streak state costs about one RTT plus the 100 ms ack delay); not tried.
+
+B2 loop (1 MiB, 10 % loss each way, server under `strace -f -e trace=process,signal`), 8 sessions each, all sha256 ok,
+0 SIGABRT, server alive every time:
+base 29.1 24.0 24.3 22.1 23.8 31.9 27.2 44.2 s (median 25.8); gate 28.5 37.3 29.9 24.8 25.6 28.4 32.1 23.5 s (median 28.4).
+The 135 s outlier of the first pipelined run did not reproduce in 8 gate or 8 base sessions (slowest 44.2 base, 37.3 gate).
+B1 loop (10 % loss, 15 sessions, gate): 15/15 ok, 0 freezes, echo back in 0.05-0.38 s.
+Typing wire counts: not re-measured on the lab this round; unchanged by construction (small states never take the pipeline
+path) and pinned by `typing_wire_schedule_is_unchanged_by_pipelining`, which passes.
+Not verified: out-of-order arrival on the real server (still no reorder injected); a wire trace of why the old version doubled bytes.

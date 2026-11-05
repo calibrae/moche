@@ -30,10 +30,10 @@
 //! the big-state RTO only the OLDEST unacked state is re-sent, against the
 //! acked state, with exactly its first content (B2); the ack for it (the
 //! server acks the highest state it holds) lets the next one be re-sent the
-//! same way. Pipelining stops for the rest of the paste as soon as the oldest
-//! state needs a re-send, and stays off after a cap shrink until the cap has
-//! climbed back to the maximum (a lossy link goes one state at a time, as
-//! before). Small states (typing) never take this path: their schedule on the
+//! same way. Pipelining engages only after `PIPELINE_AFTER_CLEAN` big states
+//! were acked in a row with no re-send, and any re-send of a big state switches
+//! it off until that streak is earned again (a lossy link goes one state at a
+//! time, as before). Small states (typing) never take this path: their schedule on the
 //! wire is unchanged (`typing_wire_schedule_is_unchanged_by_pipelining`).
 //!
 //! The cap (`state_limit`) is adaptive and applies ONLY to the next cut, never
@@ -157,6 +157,9 @@ const MAX_LOSS_RTO_MS: u64 = 3000;
 const GROW_AFTER_CLEAN: u32 = 2;
 /// Most states in flight while a paste is pipelined (see the module docs).
 pub const MAX_PIPELINE_STATES: usize = 4;
+/// Big states acked in a row with no re-send before a paste is pipelined (and
+/// again after any re-send of a big state).
+const PIPELINE_AFTER_CLEAN: u32 = 4;
 
 /// A state we have sent and the server has not (yet) acked, with its own send
 /// bookkeeping. The queue's front is the acked state, a placeholder.
@@ -253,10 +256,11 @@ pub struct Transport {
     cap_shrinks: u64,
     /// Most states in flight when pipelining (1 disables it).
     max_pipeline: usize,
-    /// A cap shrink happened and the cap has not climbed back to the maximum:
-    /// the link is lossy, so a paste goes one state at a time (a lost state
-    /// would make every state after it a wasted, undeliverable copy).
-    lossy: bool,
+    /// Consecutive big states acked without any re-send. A paste is pipelined
+    /// only after `PIPELINE_AFTER_CLEAN` of them, and any re-send of a big state
+    /// resets it: on a lossy link a lost state makes every state pipelined
+    /// behind it a wasted copy (round 13 lab: 2x the bytes at 10% loss).
+    clean_streak: u32,
     /// When the last frame carrying data (new state or re-send) went out.
     last_data_send: Option<u64>,
     /// Consecutive clean cap-filling acks since the last shrink.
@@ -315,7 +319,7 @@ impl Transport {
             state_limit: MIN_STATE_BYTES,
             cap_shrinks: 0,
             max_pipeline: MAX_PIPELINE_STATES,
-            lossy: false,
+            clean_streak: 0,
             last_data_send: None,
             clean_acks: 0,
             unsent_since: None,
@@ -591,14 +595,14 @@ impl Transport {
         for i in 1..=p {
             let size = self.bytes_to(self.sent[i].count) - self.bytes_to(self.sent[i - 1].count);
             let sends = self.sent[i].sends;
+            if size > BIG_STATE_BYTES {
+                self.clean_streak = if sends == 1 { self.clean_streak + 1 } else { 0 };
+            }
             if sends == 1 && size * 2 >= self.state_limit {
                 self.clean_acks += 1;
                 if self.clean_acks >= GROW_AFTER_CLEAN && self.state_limit < MAX_STATE_BYTES {
                     self.state_limit = (self.state_limit * 2).min(MAX_STATE_BYTES);
                     self.clean_acks = 0;
-                    if self.state_limit == MAX_STATE_BYTES {
-                        self.lossy = false;
-                    }
                 }
             } else if sends > 1 {
                 self.clean_acks = 0;
@@ -685,7 +689,6 @@ impl Transport {
         }
         self.sent[idx].shrunk = true;
         self.cap_shrinks += 1;
-        self.lossy = true;
         self.clean_acks = 0;
         self.state_limit = (self.state_limit / 2).max(MIN_STATE_BYTES);
     }
@@ -695,7 +698,7 @@ impl Transport {
     /// far), the pipeline is not full, and there is unsent input.
     fn can_pipeline(&self) -> bool {
         self.outstanding_big()
-            && !self.lossy
+            && self.clean_streak >= PIPELINE_AFTER_CLEAN
             && self.sent.len() - 1 < self.max_pipeline
             && self.sent.get(1).is_some_and(|f| f.sends == 1)
             && self.total > self.last_count()
@@ -865,6 +868,9 @@ impl Transport {
                 let diff = encode_diff(&coalesce(self.elements.iter().take(n_el)));
                 self.sent[idx].sends += 1;
                 self.sent[idx].last_sent = now_ms;
+                if big {
+                    self.clean_streak = 0;
+                }
                 self.note_resend(idx, now_ms);
                 (self.sent[idx].num, diff)
             }
@@ -2310,6 +2316,7 @@ mod tests {
         let mut model = Model::new();
         let mut t = transport();
         t.state_limit = MAX_STATE_BYTES;
+        t.clean_streak = PIPELINE_AFTER_CLEAN; // as after a clean run of acks
         let data = noise(31, 400_000);
         t.send_keys(0, &data);
         let mut firsts: Vec<Instruction> = Vec::new();
@@ -2379,6 +2386,50 @@ mod tests {
             dropped > 0,
             "no pipelined state ever lost its base: the test is toothless"
         );
+    }
+
+    /// The gate: a paste goes one state at a time until enough big states were
+    /// acked with no re-send, and any re-send of a big state closes it again.
+    #[test]
+    fn pipelining_is_earned_and_lost_on_any_resend() {
+        let mut srv = Server::new();
+        let mut t = transport();
+        t.state_limit = MAX_STATE_BYTES;
+        t.send_keys(0, &noise(61, 2_000_000));
+        let mut now;
+        let mut acked = 0;
+        for k in 0..PIPELINE_AFTER_CLEAN as u64 {
+            now = t.next_deadline_ms().unwrap();
+            let i = open_all(&srv, &drain(&mut t, now));
+            assert_eq!((i.old_num, i.new_num), (acked, acked + 1));
+            assert_eq!(t.in_flight_states(), 1, "state {k}: not earned yet");
+            acked += 1;
+            t.handle_datagram(
+                now + 1,
+                &srv.send(0, None, Server::instr(0, acked, acked, &[]))[0],
+            );
+        }
+        // earned: the next state is followed by another before any ack
+        now = t.next_deadline_ms().unwrap();
+        drain(&mut t, now);
+        now = t.next_deadline_ms().unwrap();
+        drain(&mut t, now);
+        assert_eq!(t.in_flight_states(), 2);
+        while t.in_flight_states() < MAX_PIPELINE_STATES {
+            now = t.next_deadline_ms().unwrap();
+            drain(&mut t, now);
+        }
+        // a re-send of the oldest closes the gate; after its ack, no new pipelined state
+        let d = t.next_deadline_ms().unwrap();
+        let again = open_all(&srv, &drain(&mut t, d));
+        assert_eq!(again.new_num, acked + 1);
+        assert_eq!(t.clean_streak, 0);
+        let all = acked + MAX_PIPELINE_STATES as u64;
+        t.handle_datagram(d + 1, &srv.send(0, None, Server::instr(0, 99, all, &[]))[0]);
+        let d = t.next_deadline_ms().unwrap();
+        let i = open_all(&srv, &drain(&mut t, d));
+        assert_eq!(i.old_num, all, "one state at a time again");
+        assert_eq!(t.in_flight_states(), 1);
     }
 
     /// A key typed while a paste is in flight joins the stream as one more
