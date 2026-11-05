@@ -877,3 +877,62 @@ parser state). Existing `bench` cases before and after the `Transport` input acc
 per op identical (keystroke 1.7, small server frame 8.0, heartbeat 7.9), times within 1-3 %.
 The golden scenario is IDENTICAL, and `tests/predict_wire.rs` shows an active predictor changes no
 datagram.
+
+## Linux x86_64 (9900K, KVM guest)
+
+Measured 2026-11-05, `linux-x86_64-9900k-vm`, on a new rootless QEMU/KVM lab on an i9-9900K host (`tools/x86-lab/`,
+`docs/observations-round12.md`): client guest = Ubuntu 24.04 (kernel 6.8.0-147, 2 vCPU `-cpu host`, 2 GiB, tmux 3.4, python
+3.12), server guest = Debian 13 (kernel 6.12.115, stock mosh-server 1.4.0), joined by a point-to-point L2 link
+(`qemu -netdev stream` over host loopback, RTT about 0.7 ms). moche is `moche 0.1.0 (f4ff63c, x86_64-unknown-linux-musl)`,
+built by `tools/release/build.sh x86_64-unknown-linux-musl` on a Mac (cross, static, 0.70 MB). Baseline: the Ubuntu
+`mosh-client` 1.4.0 (dynamic, 10 shared libraries). `tools/perf/measure.sh --label linux-x86_64-9900k-vm --server-ssh <user>@<a-link>
+--server-host <a-link> --reps 3 --idle-secs 60 --typing-secs 30` unchanged (`measure.sh`, `perf.py`, `report.py` are byte-identical to
+the repo copies; only a throwaway ssh key inside the lab was needed). All runs passed, paste sha256 matched every time. Medians of 3
+(condensed from the generated report: user/sys split, ctx-switch and fd rows left out).
+
+| scenario | metric | moche | stock | ratio |
+|---|---|---:|---:|---:|
+| startup | launch to first paint (s) | 0.140 (0.132-0.144) | 0.288 (0.284-0.303) | 0.48 |
+| startup | CPU (s) / peak RSS (MB) | 0.002 / 1.3 | 0.006 / 14.6 | 0.37 / 0.09 |
+| idle 60 s | CPU (s) / % of a core | 0.007 / 0.01 | 0.013 / 0.02 | 0.56 |
+| idle 60 s | peak RSS / PSS (MB) | 1.3 / 1.3 | 14.8 / 9.2 | 0.09 / 0.15 |
+| idle 60 s | voluntary ctx switches /s, minor faults | 0.6, 0 | 0.6, 362 | 1.08 |
+| idle 60 s | traffic (moche) | 25 datagrams out, 1.8 KB | | |
+| typing 30 s | CPU (s) / % of a core | 0.173 / 0.55 | 0.220 / 0.70 | 0.78 |
+| typing 30 s | voluntary ctx switches /s | 28.9 | 43.8 | 0.66 |
+| typing 30 s | minor page faults | 36 | 1 424 | 0.03 |
+| typing 30 s | peak RSS / PSS (MB) | 1.5 / 1.5 | 14.9 / 9.2 | 0.10 / 0.16 |
+| typing 30 s | datagrams for ~300 keys | 307 out, 606 in | | |
+| paste 1 MiB | paste to sha-verified (s) | 1.71 (1.50-1.76) | 1.80 (1.14-**88.5**) | 0.95 |
+| paste 1 MiB | CPU (s) | 0.119 | 1.673 (0.60-**59.2**) | 0.07 |
+| paste 1 MiB | peak RSS (MB) | 3.8 | 694 (148-**798**) | 0.01 |
+| paste 1 MiB | traffic (moche) | 838 678 B in 685 datagrams (cost 1.05x of the gzip size) | | |
+| flood 5 MB | wall (s) / CPU (s) | 1.19 / 0.003 | 1.24 / 0.003 | 0.96 |
+| colors 200x60 | wall (s) / CPU (s) | 0.13 / 0.004 | 0.15 / 0.015 | 0.84 / 0.27 |
+| colors 200x60 | peak RSS (MB) | 3.1 | 17.0 | 0.18 |
+| steady `seq` | wall (s) / CPU (s) | 0.26 / 0.002 | 0.23 / 0.002 | 1.11 / 0.89 |
+| steady `seq` | peak RSS (MB) | 1.4 | 15.7 | 0.09 |
+
+(The report counts "dynamic deps 1" for moche: it counts the line `not a dynamic executable`. `ldd` says it is static.)
+
+### Reading, against the Apple-silicon Linux VM (`linux-aarch64-vm`, same scripts) and the Mac
+
+- **Same picture, same sign everywhere that matters.** Memory 10x smaller (1.3-1.5 MB against 14.6-14.9 MB peak RSS, aarch64 1.1-1.4
+  against 14.0), startup 0.48x (aarch64 0.45x; 0.14 s against 0.29 s), idle 0.7 wakeups/s and 25 datagrams per minute, typing 307 datagrams
+  for 300 keys (1.02 per key, aarch64 306). The x86 numbers are the post-optimisation ones: typing 0.173 s CPU (0.58 ms per key) against
+  the post-optimisation aarch64 0.155-0.173 s, idle 0.007 s against 0.007 s, page faults 36 against 32 in typing and 0 in idle. The
+  musl-allocator churn of the first aarch64 run (0.49 s typing, 58 k faults, 2.7x stock) is gone on x86 (the aarch64 CPU log shows it fixed by the later
+  buffer-reuse work; not re-measured on aarch64 at `f4ff63c`).
+- **The stock client is the outlier on x86, not moche.** One of three 1 MiB pastes took the stock client 88.5 s and 59 s of CPU, peaking at
+  798 MB; the other two took 1.1-1.8 s. The aarch64 VM had stock at 0.40 s, 0.21 s CPU and 183 MB (max 242), macOS 199 MB (max 732).
+  So the stock client's paste balloon is reproduced on a third platform and is worse here (median 694 MB); moche stays at 3.8 MB and 0.12 s.
+  I did not investigate why the stock tail is so much longer; it is the distro build, one 2-vCPU guest, and only 3 runs.
+- **Paste and flood wall times are 2.5-4x those of the aarch64 VM, for both clients** (paste 1.71 s against 0.46 s, flood 1.19 s against
+  0.74 s, `seq` 0.26 s against 0.13 s; stock 1.80 / 1.24 / 0.23 against 0.40 / 0.70 / 0.18). Both clients move together, so this is the
+  lab path (`qemu -netdev stream` over loopback TCP between two 2-vCPU guests, host CPU shared), not the clients. The moche CPU for the
+  paste is 0.119 s against 0.037-0.052 s on aarch64: more per paste on x86, about 2.5x, still 14x less than the stock median here
+  and not worth a fix; I did not profile it (the paste is also slower, so more event-loop wakeups per MiB are plausible).
+- Idle CPU is now below stock (0.56x) on x86, where the first aarch64 run had 3x stock; 24 heartbeats cost nothing measurable.
+- Static: moche 0.70 MB (x86_64 musl, stripped by the build), `ldd`: not a dynamic executable, runs under `env -i`.
+- What differs from the other lab in method: server reached over a real second NIC rather than a lima network, tcpdump/netem not used
+  in this section, kernel 6.8 / 6.12 guests on an Intel host. The CPU accounting source of the report was not checked against the aarch64 run.
