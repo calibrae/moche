@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14   # Apple silicon: builds aarch64-apple-darwin natively, Linux targets with zig
+    runs-on: macos-15   # Apple silicon: builds aarch64-apple-darwin natively, Linux targets with zig
     steps:
       - uses: actions/checkout@v4
         with:

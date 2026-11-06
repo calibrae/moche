@@ -10,7 +10,7 @@ The CLI ships as three checksummed tarballs: `x86_64-unknown-linux-musl` and
    `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo deny check licenses`.
 3. Commit, then `git tag vX.Y.Z && git push origin vX.Y.Z` (a tag with a suffix, `vX.Y.Z-rc1`, is
    published as a prerelease).
-4. `.github/workflows/release.yaml` runs on the tag on a GitHub-hosted `macos-14` runner (Apple
+4. `.github/workflows/release.yaml` runs on the tag on a GitHub-hosted `macos-15` runner (Apple
    silicon): it checks that the tag matches `Cargo.toml`, builds the three targets, packages, writes
    `SHA256SUMS`, runs `verify.sh`, then `gh release create` with the three tarballs and `SHA256SUMS`
    and generated notes, using the built-in `GITHUB_TOKEN` (`permissions: contents: write`; no secret to
@@ -70,7 +70,7 @@ x86_64 still uses `cargo zigbuild` directly.
 
 ## Runner requirements
 
-- Release: GitHub-hosted `macos-14` (Apple silicon, rustup, python3, curl, shasum, tar, `gh` are
+- Release: GitHub-hosted `macos-15` (Apple silicon, rustup, python3, curl, shasum, tar, `gh` are
   preinstalled), network access to download the pinned zig (about 55 MB), `cargo-zigbuild` and the crates.
   A self-hosted runner needs the same, plus a few hundred MB of disk.
 - Optional env for macOS signing: `MOCHE_CODESIGN_IDENTITY` (and the identity in the keychain of the
