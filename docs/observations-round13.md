@@ -4,7 +4,7 @@ Date: 2026-11-05. Change: `ssp.rs` pipelines big states (up to 4 in flight), see
 
 ## Status: lab measurements were not made
 
-The x86 lab host (the x86 lab host) was unreachable for this work: the first an internal tool call (`host_status the x86 lab host`) was
+The x86 lab host (the x86 lab host) was unreachable for this work: the first an internal tool call (`host_status`) was
 refused with "this project has no an internal tool agent yet: approve its registration" and was not approved within
 the 3-minute wait, twice. Not worked around. So NOT done: the 4 MiB paste at RTT 2/50/200 ms, lossless and
 2 % / 10 % loss, against the pre-change binary and stock mosh-client; the B2 loop (>= 6 sessions, server abort
